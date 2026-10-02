@@ -252,6 +252,35 @@ def create_app(database_path: str = "/tmp/tablekeeper/tablekeeper.db") -> FastAP
             ),
         )
 
+    # -- recurring agreements --------------------------------------------- #
+    @app.post("/series")
+    def post_series(
+        request: Request,
+        body: bytes = Depends(raw_body),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> Response:
+        parsed = parsing.parse_object(body)
+        user = authenticate(request)
+        key = parsing.idempotency_key(idempotency_key)
+        status, payload = service.create_series(
+            database(request),
+            user_id=user["user_id"],
+            key=key,
+            body=parsed,
+            method="POST",
+            path="/series",
+        )
+        return JsonResponse(status_code=status, content=payload)
+
+    @app.get("/series/{series_id}")
+    def get_series(request: Request, series_id: str) -> Response:
+        # No token is not a 401 here: an agreement belongs to one diner, and
+        # anybody else is told it does not exist.
+        user_id = optional_user(request)
+        return JsonResponse(
+            status_code=200, content=service.series_detail(database(request), user_id, series_id)
+        )
+
     # -- batch moves ------------------------------------------------------ #
     @app.post("/reservation-moves")
     def post_reservation_moves(

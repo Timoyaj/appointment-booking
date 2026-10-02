@@ -190,6 +190,25 @@ def optional_party_size_field(body: Mapping[str, Any]) -> int | None:
     return party_size_field(body)
 
 
+def bounded_int_field(
+    body: Mapping[str, Any], name: str, low: int, high: int
+) -> int:
+    """A required integer within a range the spec states.
+
+    Missing, a non-integer, a boolean and out-of-range are all one refusal: the
+    spec gives 422 for every invalid value of these fields, and calls out that a
+    boolean is not an integer.
+    """
+    if name not in body or body[name] is None:
+        raise validation_failed(f"'{name}' is required")
+    value = body[name]
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise validation_failed(f"'{name}' must be an integer")
+    if not low <= value <= high:
+        raise validation_failed(f"'{name}' must be between {low} and {high}")
+    return int(value)
+
+
 def expected_revision_field(body: Mapping[str, Any]) -> int | None:
     """`expected_revision`: the revision the client believes it is changing.
 

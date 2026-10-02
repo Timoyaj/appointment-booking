@@ -66,6 +66,12 @@ def stale_revision(detail: str = "That reservation has changed since it was read
     return ApiError(409, "stale_revision", detail)
 
 
+def already_in_series() -> ApiError:
+    return ApiError(
+        409, "already_in_series", "That reservation is already part of a recurring agreement"
+    )
+
+
 def cutoff_passed() -> ApiError:
     return ApiError(
         409,

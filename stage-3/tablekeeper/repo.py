@@ -27,6 +27,8 @@ STATE_TABLES: tuple[str, ...] = (
     "reservations",
     "reservation_tables",
     "reservation_history",
+    "series",
+    "series_occurrences",
     "idempotency",
 )
 
@@ -474,6 +476,66 @@ def history_for(conn: sqlite3.Connection, reference: str) -> list[dict]:
         entry["changes"] = json.loads(entry["changes"])
         entry["accepted_terms"] = json.loads(entry["accepted_terms"])
     return entries
+
+
+# --------------------------------------------------------------------------- #
+# recurring agreements
+# --------------------------------------------------------------------------- #
+def insert_series(conn: sqlite3.Connection, data: dict) -> None:
+    conn.execute(
+        "INSERT INTO series (id, user_id, restaurant_id, anchor_reference, count, "
+        " interval_weeks, revision, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            data["id"], data["user_id"], data["restaurant_id"], data["anchor_reference"],
+            int(data["count"]), int(data["interval_weeks"]), int(data["revision"]),
+            data["created_at"],
+        ),
+    )
+
+
+def insert_occurrence(conn: sqlite3.Connection, data: dict) -> None:
+    conn.execute(
+        "INSERT INTO series_occurrences (series_id, idx, reference, exception) "
+        "VALUES (?, ?, ?, ?)",
+        (data["series_id"], int(data["idx"]), data["reference"],
+         1 if data.get("exception") else 0),
+    )
+
+
+def get_series(conn: sqlite3.Connection, series_id: str) -> dict | None:
+    return row(conn, "SELECT * FROM series WHERE id = ?", (series_id,))
+
+
+def occurrences_for(conn: sqlite3.Connection, series_id: str) -> list[dict]:
+    return rows(
+        conn,
+        "SELECT idx, reference, exception FROM series_occurrences "
+        "WHERE series_id = ? ORDER BY idx",
+        (series_id,),
+    )
+
+
+def series_of_reservation(conn: sqlite3.Connection, reference: str) -> dict | None:
+    """The agreement a booking belongs to, if it belongs to one."""
+    return row(
+        conn,
+        "SELECT s.* FROM series s JOIN series_occurrences o ON o.series_id = s.id "
+        "WHERE o.reference = ?",
+        (reference,),
+    )
+
+
+def mark_exception(conn: sqlite3.Connection, reference: str) -> None:
+    """A diner's own change to one occurrence is permanent: it stays an exception."""
+    conn.execute(
+        "UPDATE series_occurrences SET exception = 1 WHERE reference = ?", (reference,)
+    )
+
+
+def bump_series_revision(conn: sqlite3.Connection, series_id: str) -> int:
+    conn.execute("UPDATE series SET revision = revision + 1 WHERE id = ?", (series_id,))
+    found = conn.execute("SELECT revision FROM series WHERE id = ?", (series_id,)).fetchone()
+    return int(found["revision"]) if found else 0
 
 
 # --------------------------------------------------------------------------- #

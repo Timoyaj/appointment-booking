@@ -65,7 +65,8 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST $B/_test/reset \
       "opening_hours": [{"weekday":"thu","opens":"18:00","closes":"23:00"}],
       "tables": [{"id":"t_1","label":"1","capacity":2},{"id":"t_2","label":"2","capacity":4},
                  {"id":"t_3","label":"3","capacity":6}],
-      "combinable": [["t_1","t_2"],["t_2","t_3"]]
+      "combinable": [["t_1","t_2"],["t_2","t_3"]],
+      "manager_user_ids": ["u_ada"]
     }],
     "reservations": []}'
 # 204
@@ -115,10 +116,83 @@ curl -s -X POST $B/reservations/REFERENCE/cancel -H "Authorization: Bearer $TOKE
 # "status":"cancelled", and both tables are free again
 ```
 
-The same flow in the browser: open `http://localhost:8080/`, sign in as
+## Stage 3 in the same smoke test
+
+Policies, explanations, a booking's own record, and a recurring agreement. These
+continue from the fixture and `$TOKEN` above, and need one booking of their own:
+
+```bash
+# 9. Ask why a table is not offered: every table is accounted for, both rules each
+curl -s "$B/availability?restaurant_id=r_anker&date=2026-10-15&party_size=7&explain=true"
+# each slot carries "explain": [{"table_id","policy_version","available",
+#   "rules":[{"rule":"capacity","holds":..},{"rule":"no_overlap","holds":..}]}, ...]
+
+# 10. Publish a policy, as a manager, idempotently
+curl -s -X POST $B/restaurants/r_anker/policies -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: policy-1' -d '{
+    "effective_from": "2026-11-01", "slot_minutes": 30,
+    "reservation_duration_minutes": 60, "cancellation_cutoff_minutes": 60,
+    "opening_hours": [{"weekday":"thu","opens":"18:00","closes":"23:00"}],
+    "capacities": {"t_1":2,"t_2":4,"t_3":6}}'
+# 201, with the policy as supplied plus "policy_version": 1
+# A diner who is not a manager gets 403; a second publication gets version 2.
+
+curl -s $B/restaurants/r_anker/policies
+# {"policies":[...]} in publication order, and never policy 0
+
+# 11. Book under the seeded rules, then read what it accepted
+REF=$(curl -s -X POST $B/reservations -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: demo-9' -d '{
+    "restaurant_id":"r_anker","table_id":"t_2",
+    "starts_at_local":"2026-10-15T19:00","party_size":4}' | sed 's/.*"reference":"\([^"]*\)".*/\1/')
+curl -s $B/reservations/$REF/decision -H "Authorization: Bearer $TOKEN"
+# {"reference":...,"revision":1,"accepted_terms":{"policy_version":0,...}}
+
+# 12. Change it, and read the booking's own record
+curl -s -X PATCH $B/reservations/$REF -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"party_size":3}'
+curl -s $B/reservations/$REF/history -H "Authorization: Bearer $TOKEN"
+# entries: created (all three fields from null), then changed (party_size 4 -> 3)
+
+# A revision the booking no longer has is refused before anything else is judged
+curl -s -X PATCH $B/reservations/$REF -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"party_size":2,"expected_revision":1}'
+# 409 {"error":{"code":"stale_revision",...}}
+
+# 13. Adopt it as a recurring agreement: four Thursdays a week apart
+curl -s -X POST $B/series -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: series-1' \
+  -d "{\"anchor_reference\":\"$REF\",\"count\":4,\"interval_weeks\":1}"
+# 201 {"series_id":"ser_...","revision":1,"interval_weeks":1,"occurrences":[...]}
+# Occurrence 0 is the anchor itself, unchanged; the rest are ordinary bookings.
+
+# 14. Read the agreement back, and change one occurrence out of the pattern
+SERIES=$(curl -s -X POST $B/series -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: series-1' \
+  -d "{\"anchor_reference\":\"$REF\",\"count\":4,\"interval_weeks\":1}" \
+  | sed 's/.*"series_id":"\([^"]*\)".*/\1/')
+curl -s $B/series/$SERIES -H "Authorization: Bearer $TOKEN"
+# ... and the second occurrence's reference, from that response:
+NEXT=$(curl -s $B/series/$SERIES -H "Authorization: Bearer $TOKEN" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["occurrences"][1]["reference"])')
+curl -s -X PATCH $B/reservations/$NEXT -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"party_size":2}'
+curl -s $B/series/$SERIES -H "Authorization: Bearer $TOKEN"
+# that occurrence is now "exception": true and the agreement is at revision 2
+```
+
+A history, decision or agreement read by anybody but its owner is `404 not_found`,
+including with no token at all — none of them can be used to find out whether an
+identifier exists.
+
+## The same flow in the browser
+
+Open `http://localhost:8080/`, sign in as
 `ada@example.com` / `correct horse`, search Zum Anker for a party of seven, take
 the "Tables 2 & 3" cell, confirm, then copy the reference into
-`http://localhost:8080/lookup`.
+`http://localhost:8080/lookup`. No new screen is required by this stage: the grid,
+the booking form, the confirmation and the lookup are the same screens, and a
+booking's revision and accepted terms travel in the responses they already read.
 
 ## Running the tests
 
@@ -131,7 +205,7 @@ python3 -m venv .venv
 .venv/bin/python -m pytest -q
 ```
 
-The browser half is checked two ways. `tests/test_screens.py` asserts what the
+The browser half is checked two ways. `tests/test_screens.py` (32 checks) asserts what the
 routes serve: HTML, the named controls, a label on every input, and no reference
 to any other host. `tools/ui-check.mjs` loads those same screens into a DOM and
 drives the product's own script against a running service, which is how the

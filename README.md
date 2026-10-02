@@ -20,7 +20,7 @@ artifacts/        what the seats report back: runs, output, decisions, findings
 room.json         the Band export of the room (pending — see below)
 stage-1/          Dockerfile, RUN.md, source, tests   ← reservations API
 stage-2/          Dockerfile, RUN.md, source, tests   ← browser product + combined tables
-stage-3/          (not started)                       ← policies, history, recurring
+stage-3/          Dockerfile, RUN.md, source, tests   ← policies, history, recurring
 stage-4/          (not started)                       ← closure replanning, series amendments
 ```
 
@@ -64,7 +64,7 @@ python -m pytest <checkout>/tablekeeper/test/stage_1 \
 | --- | --- | --- | --- |
 | 1 | `stage-1/` | 310 passing | 120/120 passing |
 | 2 | `stage-2/` | 442 passing, plus 25 browser checks in a DOM | stage 1: 120/120 against it; stage 2: the checks that need no browser pass, the Playwright ones cannot run here |
-| 3 | — | not started | — |
+| 3 | `stage-3/` | 697 passing, plus the same 25 browser checks | stage 1: 120/120; stage 2: 2/2 of those needing no browser; stage 3: 7/7 |
 | 4 | — | not started | — |
 
 No browser can be installed in the workspace this was built in, so `stage-2/`'s
@@ -98,8 +98,8 @@ Current output: one problem, `room.json is missing`.
   room, then export it: in the Band console open the room, choose ⋮ → Download →
   Download full session, and save the file unchanged as `room.json` at the repository
   root. Each seat must have both posted and been addressed by handle.
-- **`stage-3/`, `stage-4/`** — built by the room from `dispatch/`. All four briefs are
-  complete and self-contained. See the provenance note in [FACTORY.md](FACTORY.md):
+- **`stage-4/`** — built by the room from `dispatch/`. All four briefs are complete and
+  self-contained. See the provenance note in [FACTORY.md](FACTORY.md):
   the stage folders as they stand were built outside the room, so the room's
   delivery replaces them.
 

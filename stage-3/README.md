@@ -1,15 +1,16 @@
-# Tablekeeper — Stage 2: online booking and combined tables
+# Tablekeeper — Stage 3: policies, history and recurring reservations
 
 A containerized HTTP service for restaurant table reservations, and the browser
-product in front of it. Diners search availability, book a table, receive a
-confirmation reference, and can cancel or amend their bookings — including
-changing several bookings together in one atomic request. A restaurant may
-declare pairs of tables that can be dressed as one for a larger party.
+product in front of it. Diners search availability, book a table — alone or as a
+declared pair of tables — receive a confirmation reference, and can cancel or
+amend their bookings, including several together in one atomic request.
+Restaurants publish dated booking policies, diners can ask *why* a table is not
+offered, read a booking's own record, and turn one booking into a recurring
+agreement.
 
-Stage 2 is Stage 1 carried forward and widened: every Stage 1 route, error code
-and behaviour is unchanged, and the same process now also serves four screens —
-search and availability, signup, login, and looking a booking up by reference.
-See **[RUN.md](RUN.md)** for the build-and-run command.
+Stage 3 is Stage 2 carried forward and widened: every earlier route, error code,
+screen and behaviour is unchanged, and no new screen is required — the additions
+are the API's. See **[RUN.md](RUN.md)** for the build-and-run command.
 
 ```bash
 docker build -t tablekeeper . && docker run --rm -p 8080:8080 -e PORT=8080 tablekeeper
@@ -47,6 +48,16 @@ fetched at run time.
 | The four screens, and the controls each one names | `webui.py`, `static/` | `test_screens.py`, `tools/ui-check.mjs` |
 | Out-of-order responses, a lost response and its retry | `static/tablekeeper.js` | `tools/ui-check.mjs` |
 | A Stage 1 snapshot imports and a signed-in browser stays signed in | `testhooks._upgrade_snapshot` | `test_combinations.py`, `tools/ui-check.mjs` |
+| **Stage 3** — published policies: complete, immutable, versioned, manager-only | `policies.py`, `service.publish_policy` | `test_policies.py` |
+| A booking's date selects the policy that decides it | `domain.rules_on`, `domain.Rules` | `test_policies.py` |
+| `revision` and `accepted_terms` on every reservation response | `domain.reservation_body`, `migrations/0003_stage3.sql` | `test_history.py` |
+| `expected_revision` and 409 `stale_revision` | `parsing.expected_revision_field`, `service.py` | `test_history.py` |
+| A booking's own record: created, changed, cancelled | `history.py`, `reservation_history` | `test_history.py` |
+| `/decision`: the terms a booking currently holds | `service.reservation_decision` | `test_history.py` |
+| `explain=true`: both rules, for every table | `domain.availability` | `test_explain.py` |
+| Recurring agreements: `POST /series`, `GET /series/{id}` | `service.create_series`, `migrations/0004_series.sql` | `test_series.py` |
+| Exceptions and agreement revisions on change, cancel and batch | `service._note_series_change` | `test_series.py` |
+| An earlier stage's snapshot imports with terms and a record rebuilt | `testhooks._upgrade_snapshot` | `test_history.py`, `test_series.py` |
 
 299 tests, all talking to the service over HTTP through the ASGI app.
 
@@ -215,6 +226,86 @@ Where no browser is installed, `tools/ui-check.mjs` loads these screens into a D
 and drives the product's own script against a running service, which is how the
 three rules above are verified rather than assumed.
 
+### Policies, and the terms a booking accepted
+
+A restaurant's managers publish **complete** policies — every field, never a patch
+— and each is immutable and versioned from 1 per restaurant. Policy 0 is the
+restaurant's own seeded configuration and is never listed, because it was never
+published. A booking's local start date selects the greatest `effective_from` not
+later than that date, ties going to the greater version, so publication order and
+effective-date order are allowed to differ.
+
+Everything that decides a booking is decided by the selected policy: the slot grid,
+the service windows, the sitting length, the capacities (for a pair, their sum) and
+the cutoff. The restaurant's detail endpoint keeps reporting the seeded
+configuration, as specified — a policy changes what the room does, not what it is.
+
+A reservation carries its `revision` and a snapshot of the whole policy it
+accepted, minus the effective date. That snapshot is what makes publication safe:
+a new policy never edits a booking already made, a cancellation is judged by the
+cutoff the diner actually accepted, and a real amendment checks that cutoff first
+and *then* validates every resulting field against the policy for the resulting
+date, replacing the terms and the end time together and adding exactly one
+revision. A change that changes nothing does none of that. `expected_revision` lets
+a client say which revision it meant to change; one that does not match is
+`409 stale_revision`, before the booking's state or any field is judged.
+
+### A booking's own record
+
+`GET /reservations/{reference}/history` is the booking's memory, oldest first, with
+`seq` increasing by exactly one so the order is total even when two writes land in
+the same second. `created` names all three fields from nothing; `changed` names
+only what changed, in the order `table_id`, `starts_at_local`, `party_size`;
+`cancelled` carries no changes and nothing follows it. Every entry keeps the
+revision and the complete terms that resulted from it, so an old entry never
+acquires newer terms. A pair is recorded as `table_ids` in the restaurant's
+declared order, while the booking itself keeps the order it was asked for — which
+is also what makes a reversed pair the same seating rather than an amendment.
+`GET /reservations/{reference}/decision` reports the terms the booking holds now,
+including after cancellation.
+
+Neither endpoint can be used to discover whether a reference exists: anybody who is
+not the owner gets the same 404 as a reference that was never issued, including a
+caller who sent no token at all.
+
+### Explaining availability
+
+`explain=true` accounts for **every** table of the restaurant at every slot, in
+fixture order, available or not, reporting both rules that decide it — `capacity`
+and `no_overlap` — including for a table some other rule already excluded. A rule
+that holds is reported holding. `available` is true exactly when both hold, and the
+tables whose `available` is true are exactly `available_table_ids` in the same
+order. Without the parameter the response keeps its earlier shape.
+
+### Recurring agreements
+
+`POST /series` adopts an existing booking as occurrence zero and generates the
+rest: occurrence *i* is the anchor's local calendar date plus *i* × interval × 7
+days at the same local clock time, with the anchor's party size and tables. The
+anchor itself is untouched — reference, identity, revision, terms, record,
+timestamps and its original idempotent response all stay as they were.
+
+Generated occurrences are ordinary bookings, which is why the operation is
+all-or-nothing: each one selects the policy for its own date and obeys the ordinary
+opening, daylight-saving and occupancy rules, so a date where the local time does
+not exist refuses the whole adoption, and so does the first date that cannot be
+seated. Nothing partial survives a refusal — no bookings, no records, no counters,
+and no claim on the idempotency key.
+
+A diner's own amendment of one occurrence marks it an exception permanently and
+counts once against the agreement; a cancellation counts once but is not an
+exception, and cancelling the anchor leaves its siblings standing. A batch of moves
+counts once per affected agreement, whichever occurrences in it changed. Replays
+return the original agreement however much has changed since.
+
+### The restaurant's own revision
+
+Each restaurant counts its successful writes: one for a booking, a real amendment,
+a cancellation or a publication, one for a whole batch of moves and one for a whole
+adoption, and none for a no-op, a failure or a replay. It starts at 0 after a reset.
+No stage-3 response carries it; it is the counter a later stage's seating plans are
+judged against, and it is visible in an exported snapshot.
+
 ---
 
 ## Project layout
@@ -229,6 +320,8 @@ tablekeeper/
   api.py                routes, plumbing and every error handler
   webui.py              the four screen routes, rendered server-side
   static/               tablekeeper.css, tablekeeper.js — served by this image
+  policies.py           what a published policy must contain, and how it reads
+  history.py            a booking's own record: what changed, from what, to what
   service.py            book / list / read / cancel / amend / move
   domain.py             the rule set: grid, hours, DST, capacity, occupancy
   testhooks.py          reset, export, import
@@ -240,8 +333,8 @@ tablekeeper/
   db.py                 SQLite engine: thread-local, re-entrant BEGIN IMMEDIATE
   clock.py              injectable clock so tests never sleep
   errors.py             status + code for every rejection
-  migrations/           0001_core.sql, 0002_stage2.sql
-tests/                  442 tests over HTTP
+  migrations/           0001_core.sql … 0004_series.sql
+tests/                  697 tests over HTTP
 tools/ui-check.mjs      drives the screens in a DOM against a running service
 ```
 
@@ -281,3 +374,14 @@ a reading of the brief, not something it states outright:
 | The date input's starting value | today's date in the service's own calendar | Today may be a day the restaurant does not serve; the grid then says so rather than the input guessing a bookable day |
 | `GET /restaurants/{id}` for a restaurant that declares no pairs | `"combinable": []` | One shape for a restaurant whether or not it joins tables, so a client never has to ask whether the field is missing or empty |
 | A screen route versus the API's conventions | screens return HTML; every other path, known or not, keeps the JSON error envelope | §3.4's `application/json` convention governs the API, and the four screen routes are not API routes |
+| Anything wrong inside a policy body | `422 validation_failed`, including a wrong JSON type | The spec states one rule for the policy as a whole — "invalid policy is 422" — so it is applied to the policy as a whole rather than splitting wrong types out into 400 the way a request body's fields are |
+| `explain=` with an empty value | `422 validation_failed` | The parameter was sent, and its only accepted value is `true`; reading it as absent would answer a question nobody asked |
+| Where `stale_revision` sits | before the booking's state and before any field is validated | The spec places it before cutoff and validation: a client whose view of the booking is old is told that first, whatever else is wrong |
+| A pair written in the other order, on a booking that already holds it | not an amendment, and the stored order is left alone | The declaration is unordered, so the set is what the diner holds; rewriting the order would be a change nobody made |
+| The order a pair is recorded in | the restaurant's declared combination order | The ledger names one seating one way, so a reversed request and the original read the same in the record |
+| An empty `opening_hours` in a policy | accepted, and it closes the room | As in stage 1, a weekday with no window is closed; the field is required, and an empty list is a value |
+| Managers named by a fixture | taken as given, like every other seeded reference | Seed data describes a world rather than being a request the API would have accepted |
+| A date an agreement cannot seat | the whole adoption is refused | Occurrences are ordinary bookings, so the ordinary error applies; skipping a date would silently deliver a different agreement from the one asked for |
+| `count` | includes the anchor, so `count=2` makes one new booking | The spec says so, and the response carries exactly `count` occurrences |
+| History, decision and agreement reads with no token | 404, not 401 | The spec resolves these three against the general 401 rule so that none of them reveals whether an identifier exists; credentials that are offered and wrong stay a 401 |
+| The restaurant revision | counted, never reported | Stage 3 names the increments but exposes no reading of it, so the counter is kept where a later stage can judge a seating plan against it

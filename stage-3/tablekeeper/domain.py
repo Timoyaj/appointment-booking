@@ -589,6 +589,11 @@ def new_reservation_id() -> str:
     return f"res_{secrets.token_hex(12)}"
 
 
+def new_series_id() -> str:
+    """An opaque identifier for a recurring agreement."""
+    return f"ser_{secrets.token_hex(12)}"
+
+
 def new_reference(conn: sqlite3.Connection) -> str:
     """6-12 characters of A-Z0-9, unique across all reservations, never reused."""
     for _ in range(12):

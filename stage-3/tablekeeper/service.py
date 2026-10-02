@@ -32,11 +32,13 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Sequence
+from datetime import timedelta
 
 from . import domain, history, idempotency, parsing, policies, repo
 from .clock import now
 from .db import Database
 from .errors import (
+    already_in_series,
     cutoff_passed,
     forbidden,
     malformed_request,
@@ -46,7 +48,7 @@ from .errors import (
     table_unavailable,
     validation_failed,
 )
-from .tztime import overlaps, rfc3339
+from .tztime import overlaps, parse_local, rfc3339
 
 MAX_MOVES = 8
 
@@ -83,6 +85,7 @@ def _place(
     reference: str | None = None,
     reservation_id: str | None = None,
     exclude_reference: str | None = None,
+    count_restaurant_write: bool = True,
 ) -> dict:
     """Validate a placement and write it. Returns the stored row."""
     restaurant = domain.require_restaurant(conn, restaurant_id)
@@ -138,7 +141,8 @@ def _place(
         accepted_terms=terms,
         at=record["created_at"],
     )
-    repo.bump_restaurant_revision(conn, restaurant_id)
+    if count_restaurant_write:
+        repo.bump_restaurant_revision(conn, restaurant_id)
     return repo.get_reservation_by_reference(conn, record["reference"])  # type: ignore[return-value]
 
 
@@ -184,6 +188,36 @@ def create_reservation(
         return 201, response
 
 
+def _note_series_change(conn: sqlite3.Connection, reference: str, *, exception: bool) -> None:
+    """One increment for the agreement a booking belongs to, if it belongs to one.
+
+    A diner's own amendment of an occurrence marks it an exception permanently: the
+    sitting has been taken out of the pattern, and putting the date back does not
+    put it in again. A cancellation counts, but is not an exception.
+    """
+    agreement = repo.series_of_reservation(conn, reference)
+    if agreement is None:
+        return
+    if exception:
+        repo.mark_exception(conn, reference)
+    repo.bump_series_revision(conn, agreement["id"])
+
+
+def _shift_local(starts_at_local: str, days: int) -> str:
+    """The same local clock time on a later calendar date.
+
+    Adding days to a bare local time is exactly what an agreement asks for: the
+    calendar date moves and the clock time does not, so a weekly series keeps its
+    hour across a daylight-saving change and then meets the same rules as any other
+    booking on the date it lands on — including a date where that hour does not
+    exist, which refuses the whole adoption.
+    """
+    naive = parse_local(starts_at_local)
+    if naive is None:  # pragma: no cover - the anchor was placed through the API
+        raise validation_failed("'starts_at_local' is not a bare local time")
+    return (naive + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M")
+
+
 # --------------------------------------------------------------------------- #
 # reads
 # --------------------------------------------------------------------------- #
@@ -224,6 +258,10 @@ def cancel_reservation(db: Database, user_id: str, reference: str) -> dict:
             revision=revision,
             accepted_terms=record["accepted_terms"],
         )
+        # Cancelling one occurrence of an agreement is the agreement's business, so
+        # it counts once there — but it is not a diner reshaping a sitting, so it
+        # does not make that occurrence an exception.
+        _note_series_change(conn, reference, exception=False)
         repo.bump_restaurant_revision(conn, record["restaurant_id"])
         updated = repo.get_reservation_by_reference(conn, reference)
         return domain.reservation_body(updated)  # type: ignore[arg-type]
@@ -320,6 +358,9 @@ def amend_reservation(db: Database, user_id: str, reference: str, body: dict) ->
             conn, reference=reference, event=history.CHANGED, changes=changes,
             revision=revision, accepted_terms=terms,
         )
+        # An individual amendment of one occurrence is the diner taking that sitting
+        # out of the pattern, permanently.
+        _note_series_change(conn, reference, exception=True)
         repo.bump_restaurant_revision(conn, record["restaurant_id"])
         updated = repo.get_reservation_by_reference(conn, reference)
         return domain.reservation_body(updated)  # type: ignore[arg-type]
@@ -495,6 +536,7 @@ def move_reservations(
 
         responses: list[dict] = []
         changed_any = False
+        affected_series: set[str] = set()
         for plan in planned:
             record = plan["record"]
             reference = record["reference"]
@@ -541,8 +583,15 @@ def move_reservations(
                 revision=revision, accepted_terms=terms,
             )
             changed_any = True
+            agreement = repo.series_of_reservation(conn, reference)
+            if agreement is not None:
+                affected_series.add(agreement["id"])
+                repo.mark_exception(conn, reference)
             updated = repo.get_reservation_by_reference(conn, reference)
             responses.append(domain.reservation_body(updated))  # type: ignore[arg-type]
+
+        for series_id in sorted(affected_series):
+            repo.bump_series_revision(conn, series_id)
 
         # One increment for the whole batch, and none at all if it changed nothing.
         if changed_any:
@@ -560,6 +609,149 @@ def move_reservations(
             response_body=response,
         )
         return 201, response
+
+
+# --------------------------------------------------------------------------- #
+# POST /series — adopt a booking as occurrence zero of a recurring agreement
+# --------------------------------------------------------------------------- #
+def create_series(
+    db: Database, *, user_id: str, key: str, body: dict, method: str, path: str
+) -> tuple[int, dict]:
+    """Adopt an existing booking and generate the rest of the agreement.
+
+    Every generated occurrence is an ordinary booking: it selects the policy for its
+    own date, obeys the ordinary opening, daylight-saving and occupancy rules, and
+    gets its own reference and its own record. That is also why the operation is
+    all-or-nothing — the first occurrence that cannot be placed refuses the whole
+    adoption, and nothing survives the refusal: no bookings, no records, no
+    counters, and no claim on the idempotency key.
+    """
+    with db.transaction() as conn:
+        stored = idempotency.lookup(
+            conn, user_id=user_id, key=key, method=method, path=path, body=body
+        )
+        if stored is not None:
+            return 200, stored["response_body"]
+
+        anchor_reference = parsing.string_field(
+            body, "anchor_reference", max_length=parsing.MAX_ID_LENGTH
+        )
+        count = parsing.bounded_int_field(body, "count", 2, 12)
+        interval_weeks = parsing.bounded_int_field(body, "interval_weeks", 1, 4)
+
+        anchor = repo.get_reservation_by_reference(conn, anchor_reference)
+        # Another diner's booking is indistinguishable from one that does not exist.
+        if anchor is None or anchor["user_id"] != user_id:
+            raise not_found(f"No reservation with reference '{anchor_reference}'")
+        restaurant = domain.require_restaurant(conn, anchor["restaurant_id"])
+        if anchor["status"] == "cancelled":
+            raise reservation_cancelled()
+        if domain.is_past_cutoff(anchor, restaurant, now()):
+            raise cutoff_passed()
+        if repo.series_of_reservation(conn, anchor_reference) is not None:
+            raise already_in_series()
+
+        series_id = domain.new_series_id()
+        created_at = rfc3339(now())
+        occurrences: list[dict] = []
+        for index in range(count):
+            if index == 0:
+                # Occurrence zero is the anchor itself. Its reference, identity,
+                # revision, terms, record, timestamps and original idempotent
+                # response all stay exactly as they were.
+                record = anchor
+            else:
+                record = _place(
+                    conn,
+                    user_id=user_id,
+                    restaurant_id=anchor["restaurant_id"],
+                    table_ids=list(anchor["table_ids"]),
+                    starts_at_local=_shift_local(
+                        anchor["starts_at_local"], index * interval_weeks * 7
+                    ),
+                    party_size=int(anchor["party_size"]),
+                    created_at=created_at,
+                    count_restaurant_write=False,
+                )
+            occurrences.append(
+                {
+                    "index": index,
+                    "reference": record["reference"],
+                    "exception": False,
+                    "reservation": domain.reservation_body(record),
+                }
+            )
+
+        repo.insert_series(
+            conn,
+            {
+                "id": series_id,
+                "user_id": user_id,
+                "restaurant_id": anchor["restaurant_id"],
+                "anchor_reference": anchor["reference"],
+                "count": count,
+                "interval_weeks": interval_weeks,
+                "revision": 1,
+                "created_at": created_at,
+            },
+        )
+        for occurrence in occurrences:
+            repo.insert_occurrence(
+                conn,
+                {
+                    "series_id": series_id,
+                    "idx": occurrence["index"],
+                    "reference": occurrence["reference"],
+                    "exception": False,
+                },
+            )
+        # One increment for the whole adoption, however many bookings it made.
+        repo.bump_restaurant_revision(conn, anchor["restaurant_id"])
+
+        response = {
+            "series_id": series_id,
+            "revision": 1,
+            "interval_weeks": interval_weeks,
+            "occurrences": occurrences,
+        }
+        idempotency.record(
+            conn, user_id=user_id, key=key, method=method, path=path,
+            body=body, status_code=201, response_body=response,
+        )
+        return 201, response
+
+
+def _series_body(conn: sqlite3.Connection, agreement: dict) -> dict:
+    """An agreement and the current state of every booking in it."""
+    occurrences = []
+    for entry in repo.occurrences_for(conn, agreement["id"]):
+        record = repo.get_reservation_by_reference(conn, entry["reference"])
+        occurrences.append(
+            {
+                "index": int(entry["idx"]),
+                "reference": entry["reference"],
+                "exception": bool(entry["exception"]),
+                "reservation": domain.reservation_body(record)
+                if record is not None
+                else None,  # pragma: no cover - an occurrence is a booking
+            }
+        )
+    return {
+        "series_id": agreement["id"],
+        "revision": int(agreement["revision"]),
+        "interval_weeks": int(agreement["interval_weeks"]),
+        "occurrences": occurrences,
+    }
+
+
+def series_detail(db: Database, user_id: str | None, series_id: str) -> dict:
+    """Only the diner who made the agreement may read it; anybody else gets the
+    same 404 as an agreement that does not exist."""
+    with db.read() as conn:
+        agreement = repo.get_series(conn, series_id)
+        if agreement is None or agreement["user_id"] != user_id:
+            raise not_found(f"No recurring agreement with id '{series_id}'")
+        return _series_body(conn, agreement)
 
 
 # --------------------------------------------------------------------------- #

@@ -1,7 +1,7 @@
-# Tablekeeper — Stage 2
+# Tablekeeper — Stage 3
 #
-# Builds a self-contained HTTP service: the reservation API and the browser
-# product on one port. Everything the runtime needs (Python, the web framework,
+# Builds a self-contained HTTP service: the reservation API, its published
+# policies and recurring agreements, and the browser product, on one port. Everything the runtime needs (Python, the web framework,
 # the IANA timezone database, the application code, the stylesheet and the
 # browser script) is baked in at build time; nothing is fetched when the
 # container runs, so the screens render with no outbound network.
