@@ -18,3 +18,4 @@ data/
 
 # Local reference material (specs + official checks); never committed
 .ref/
+node_modules/

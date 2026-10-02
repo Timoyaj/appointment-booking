@@ -17,7 +17,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import auth, parsing, service, testhooks
+from . import auth, parsing, service, testhooks, webui
 from .db import Database
 from .errors import ApiError
 
@@ -209,6 +209,10 @@ def create_app(database_path: str = "/tmp/tablekeeper/tablekeeper.db") -> FastAP
             path="/reservation-moves",
         )
         return JsonResponse(status_code=status, content=payload)
+
+    # -- browser screens -------------------------------------------------- #
+    # Registered after the API so a screen route can never shadow an endpoint.
+    webui.register(app)
 
     # -- errors ----------------------------------------------------------- #
     @app.exception_handler(ApiError)

@@ -19,7 +19,7 @@ dispatch/         the self-contained task handed to the room for each stage
 artifacts/        what the seats report back: runs, output, decisions, findings
 room.json         the Band export of the room (pending — see below)
 stage-1/          Dockerfile, RUN.md, source, tests   ← reservations API
-stage-2/          (dispatched)                        ← browser product + combined tables
+stage-2/          Dockerfile, RUN.md, source, tests   ← browser product + combined tables
 stage-3/          (not started)                       ← policies, history, recurring
 stage-4/          (not started)                       ← closure replanning, series amendments
 ```
@@ -63,9 +63,17 @@ python -m pytest <checkout>/tablekeeper/test/stage_1 \
 | Stage | Folder | Own suite | Shipped checks |
 | --- | --- | --- | --- |
 | 1 | `stage-1/` | 310 passing | 120/120 passing |
-| 2 | dispatched | — | — |
+| 2 | `stage-2/` | 442 passing, plus 25 browser checks in a DOM | stage 1: 120/120 against it; stage 2: the checks that need no browser pass, the Playwright ones cannot run here |
 | 3 | — | not started | — |
 | 4 | — | not started | — |
+
+No browser can be installed in the workspace this was built in, so `stage-2/`'s
+screens are verified two ways instead: `tests/test_screens.py` asserts what the
+routes serve, and `tools/ui-check.mjs` loads those screens into a DOM and drives
+the product's own script against the live service — out-of-order responses, a
+lost booking response and its retry, a refusal that refreshes the grid and keeps
+the form, combined tables, lookup and cancel. Layout and paint are not checked by
+either and need a real browser.
 
 A green run on the shipped checks is not evidence of a stage: only part of each suite
 ships, and the rest is written in the specification. `stage-1/README.md` records the
@@ -90,8 +98,10 @@ Current output: one problem, `room.json is missing`.
   room, then export it: in the Band console open the room, choose ⋮ → Download →
   Download full session, and save the file unchanged as `room.json` at the repository
   root. Each seat must have both posted and been addressed by handle.
-- **`stage-2/`, `stage-3/`, `stage-4/`** — built by the room from `dispatch/`. Stage 2
-  is dispatched; the brief is complete and self-contained.
+- **`stage-3/`, `stage-4/`** — built by the room from `dispatch/`. All four briefs are
+  complete and self-contained. See the provenance note in [FACTORY.md](FACTORY.md):
+  the stage folders as they stand were built outside the room, so the room's
+  delivery replaces them.
 
 After `room.json` lands, re-run `harness check`, then clone fresh and run
 `python -m harness run --track tablekeeper --repo <clone> --all`.

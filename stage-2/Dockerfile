@@ -1,8 +1,10 @@
-# Tablekeeper — Stage 1
+# Tablekeeper — Stage 2
 #
-# Builds a self-contained HTTP service. Everything the runtime needs (Python,
-# the web framework, the IANA timezone database and the application code) is
-# baked in at build time; nothing is fetched when the container runs.
+# Builds a self-contained HTTP service: the reservation API and the browser
+# product on one port. Everything the runtime needs (Python, the web framework,
+# the IANA timezone database, the application code, the stylesheet and the
+# browser script) is baked in at build time; nothing is fetched when the
+# container runs, so the screens render with no outbound network.
 
 FROM python:3.12-slim
 
