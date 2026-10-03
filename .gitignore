@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# TableKeeper runtime data (SQLite database + WAL)
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Legacy Postgres demo
+.env
+
+# Local reference material (specs + official checks); never committed
+.ref/
+node_modules/
