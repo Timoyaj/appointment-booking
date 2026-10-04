@@ -1,0 +1,9 @@
+# Runtime dependencies, installed at image build time.
+# Storage is SQLite from the Python standard library, so there is no database
+# server or native driver to install.
+fastapi>=0.110
+uvicorn>=0.27
+
+# Python's zoneinfo needs the IANA database; the PyPI package guarantees the
+# 2026 DST transitions are present even on slim base images without tzdata.
+tzdata>=2024.1

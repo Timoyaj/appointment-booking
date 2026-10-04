@@ -1,0 +1,15 @@
+{
+  "name": "tablekeeper-browser-checks",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Drives Tablekeeper's screens in a DOM, against a running service: the four diner screens and the restaurant console.",
+  "scripts": {
+    "check": "node ui-check.mjs http://127.0.0.1:8080 && node console-check.mjs http://127.0.0.1:8080",
+    "check:diner": "node ui-check.mjs http://127.0.0.1:8080",
+    "check:console": "node console-check.mjs http://127.0.0.1:8080"
+  },
+  "devDependencies": {
+    "jsdom": "^30.1.2"
+  }
+}

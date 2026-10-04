@@ -1,0 +1,41 @@
+# Tablekeeper — run it for a real restaurant
+#
+# `docker compose up` and a restaurant is running with state that survives a
+# restart. Without compose, the equivalent is:
+#
+#   docker build -t tablekeeper .
+#   docker run --rm -p 8080:8080 -v tablekeeper-data:/data tablekeeper
+#
+# Because TABLEKEEPER_TEST_HOOKS=0 is baked into the image, the unauthenticated
+# /_test/* control surface is not served here. To run the reference checks —
+# which drive a service through those endpoints — build with the variable
+# unset for that container instead:
+#
+#   docker run --rm -p 8080:8080 -e TABLEKEEPER_TEST_HOOKS=1 tablekeeper
+
+services:
+  tablekeeper:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      TABLEKEEPER_DB: /data/tablekeeper.db
+      TABLEKEEPER_TEST_HOOKS: "0"
+      # Sessions last this long, in minutes. 30 days unless changed.
+      # TABLEKEEPER_TOKEN_TTL_MINUTES: "43200"
+      #
+      # Mail. Without these the outbox fills and nothing is marked sent, which is
+      # the honest state of a service with no mail server: the console shows what
+      # is waiting rather than pretending it went out.
+      # TABLEKEEPER_SMTP_HOST: smtp.example.com
+      # TABLEKEEPER_SMTP_PORT: "587"
+      # TABLEKEEPER_SMTP_FROM: bookings@example.com
+      # TABLEKEEPER_SMTP_USERNAME: bookings@example.com
+      # TABLEKEEPER_SMTP_PASSWORD: change-me
+    volumes:
+      - tablekeeper-data:/data
+    restart: unless-stopped
+
+volumes:
+  tablekeeper-data:
