@@ -234,7 +234,11 @@ def main() -> None:
         f"{summary.get('sent', 0)} sent, {summary.get('failed', 0)} failed."
     )
     print(f"\nSign in at /console as {OWNER[0]} / {OWNER[1]}")
-    print("The console shows the room, the staff, the outbox and the audit trail.")
+    print(
+        "The console shows the room, the staff, who is coming this week (with "
+        "no-show and \"party came\"), the deposit form, this month's numbers, the "
+        "outbox and the audit trail."
+    )
 
 
 if __name__ == "__main__":

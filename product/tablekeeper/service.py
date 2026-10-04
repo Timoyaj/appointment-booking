@@ -2135,11 +2135,3 @@ def confirm_email_verification(db: Database, *, body: dict) -> dict:
     with db.transaction() as conn:
         return recovery.confirm_verification(conn, token=token)
 
-
-def email_is_verified(db: Database, user_id: str) -> bool:
-    with db.read() as conn:
-        return recovery.is_verified(conn, user_id)
-
-
-def require_verified_email() -> bool:
-    return recovery.require_verified_email()
