@@ -10,7 +10,7 @@ Two properties the spec depends on come from here:
 
 Connections are thread-local and WAL is on, so the HTTP thread pool can read
 while a writer holds the lock. State is ephemeral: the database is a file inside
-the container and need not survive a restart.
+the deployment, and a volume is what makes it outlive one.
 """
 
 from __future__ import annotations
@@ -30,7 +30,19 @@ class Database:
         self.path = path
         self.busy_timeout_ms = busy_timeout_ms
         self._local = threading.local()
-        parent = Path(path).parent
+        self._ensure_parent()
+
+    def _ensure_parent(self) -> None:
+        """Make sure the directory the database lives in is there.
+
+        Checked before every new connection rather than only at startup: a
+        deployment whose data directory is recreated — a volume remounted, a
+        container's scratch space replaced — should go back to serving, not hand
+        every request a 500 for the rest of its life. A database that is genuinely
+        gone is a data loss problem, and it is better reported as a working
+        service with an empty book than as a service that cannot open a file.
+        """
+        parent = Path(self.path).parent
         if str(parent) not in ("", "."):
             parent.mkdir(parents=True, exist_ok=True)
 
@@ -38,6 +50,7 @@ class Database:
         conn: sqlite3.Connection | None = getattr(self._local, "conn", None)
         if conn is not None:
             return conn
+        self._ensure_parent()
         conn = sqlite3.connect(
             self.path,
             timeout=self.busy_timeout_ms / 1000.0,

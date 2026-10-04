@@ -125,10 +125,17 @@ Deliberately, and in the order the assessment ranked them:
 
 ## How this was verified
 
+Three layers, all run against a live service:
+
 ```bash
 cd product
 python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/python -m pytest -q          # 940 passed
+.venv/bin/python -m pytest -q                     # 955 passed
+
+# the diner's screens, driven in a DOM against a running service
+cd tools && npm install jsdom
+node ui-check.mjs      http://127.0.0.1:8080      # 25 passed, 0 failed
+node console-check.mjs http://127.0.0.1:8080      #  8 passed, 0 failed
 ```
 
 The 887 tests that came from `stage-4/` pass unchanged, which is the evidence
@@ -137,6 +144,23 @@ answer the earlier stages gave. The new tests are in `tests/test_product.py`
 (sessions, throttling, onboarding, roles, the outbox, the audit trail) and
 `tests/test_console_screens.py` (the two new screens).
 
-Known gaps in the verification: the container has never been built in this
-workspace (no Docker daemon), and no message has been delivered over SMTP to a
-real server. Both are stated above rather than implied by a green suite.
+`console-check.mjs` is the one worth pointing at: it loads `/console` and
+`/start` into a DOM, gives the page a real `fetch`, evaluates `static/console.js`
+against the running service, and asserts the dashboard draws the room, its staff
+and its outbox, that a stranger is told they work nowhere, that a signed-out
+visitor is asked to sign in and **cannot** create a restaurant from the form, and
+that submitting the onboarding form really opens one.
+
+It also found two bugs that no HTTP-level test would have: the session key in
+`console.js` did not match the diner script's (so signing in on `/login` left the
+console signed out), and the script booted only on `DOMContentLoaded`, which had
+already fired by the time a deferred script runs.
+
+### Known gaps in the verification
+
+- **The container has never been built here** — there is no Docker daemon in this
+  workspace, so `Dockerfile`, `docker-compose.yml` and the `TABLEKEEPER_TEST_HOOKS=0`
+  default are verified by reading, not by building.
+- **No message has been delivered over SMTP to a real server.** The outbox, the
+  retry and failure states and the transport contract are tested; the socket is not.
+- **Layout and paint are not checked.** jsdom sees the DOM, not the pixels.

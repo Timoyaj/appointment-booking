@@ -9,7 +9,10 @@
 (function () {
   "use strict";
 
-  const SESSION_KEY = "tablekeeper.session";
+  // The same key the diner's script writes: one session for the whole product,
+  // so signing in on the diner's screen is being signed in on the console, and
+  // signing out anywhere signs out everywhere.
+  const SESSION_KEY = "tablekeeper.session.v1";
 
   function readSession() {
     try {
@@ -388,8 +391,18 @@
     drawConsole(chosen);
   }
 
-  document.addEventListener("DOMContentLoaded", () => {
+  function boot() {
     wireStart();
     wireConsole();
-  });
+  }
+
+  // The script is loaded with `defer`, so by the time it runs the document is
+  // usually parsed already — in which case `DOMContentLoaded` has fired and a
+  // listener for it would never be called. Boot now if the document is ready,
+  // and wait for the event only when it genuinely has not arrived yet.
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", boot);
+  } else {
+    boot();
+  }
 })();
