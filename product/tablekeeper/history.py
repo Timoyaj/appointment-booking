@@ -28,6 +28,10 @@ CREATED = "created"
 CHANGED = "changed"
 CANCELLED = "cancelled"
 REASSIGNED = "reassigned"
+# The party did not come. Nobody changed the booking: the restaurant recorded what
+# happened to it, which is why the entry carries the revision and terms the booking
+# already had rather than a new revision of its own.
+NO_SHOW = "no_show"
 
 
 def declared_order(table_ids: Sequence[str], combinable: Sequence[tuple[str, str]]) -> list[str]:

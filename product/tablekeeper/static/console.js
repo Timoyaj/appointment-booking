@@ -252,7 +252,38 @@
     return hours.map((h) => `${h.weekday} ${h.opens}–${h.closes}`).join(", ");
   }
 
-  async function drawConsole(restaurantId) {
+  /** A calendar date in the restaurant's own zone, as YYYY-MM-DD. */
+  function localDate(zone) {
+    // `en-CA` is the locale whose short date is already ISO-ordered.
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: zone, year: "numeric", month: "2-digit", day: "2-digit",
+    }).format(new Date());
+  }
+
+  function monthBounds(zone) {
+    const today = localDate(zone);
+    return {from: `${today.slice(0, 7)}-01`, to: today};
+  }
+
+  function money(cents, currency) {
+    const units = (Number(cents) / 100).toFixed(2);
+    return `${units} ${String(currency || "").toUpperCase()}`.trim();
+  }
+
+  function actionButton(label, handler) {
+    const button = element("button", "button button-quiet button-small", label);
+    button.type = "button";
+    button.addEventListener("click", handler);
+    return button;
+  }
+
+  async function act(status, path, options, after) {
+    const result = await api(path, options);
+    if (!result.ok) return say(status, describeError(result), "error");
+    if (after) after(result.payload);
+  }
+
+  async function drawConsole(restaurantId, notice) {
     const body = document.getElementById("console-body");
     const status = document.getElementById("console-status");
     body.textContent = "";
@@ -264,7 +295,10 @@
       return say(status, "That restaurant is not yours to look after.", "error");
     }
     if (!detail.ok) return say(status, describeError(detail), "error");
-    say(status, "");
+    // The redraw clears the status line, so whatever just happened is put back
+    // once the page is up to date: a manager who clicked something must still be
+    // able to read what it did.
+    say(status, notice ? notice.message : "", notice ? notice.kind : "");
     const restaurant = detail.payload;
 
     const head = element("section", "panel console-card");
@@ -334,9 +368,10 @@
             `${result.payload.queued} message(s) are waiting, but this service has ` +
             "no mail server configured, so nothing was sent.", "uncertain");
         }
-        say(status, `Delivered ${result.payload.sent}, failed ${result.payload.failed}.`,
-          result.payload.failed ? "uncertain" : "success");
-        drawConsole(restaurantId);
+        drawConsole(restaurantId, {
+          message: `Delivered ${result.payload.sent}, failed ${result.payload.failed}.`,
+          kind: result.payload.failed ? "uncertain" : "success",
+        });
       });
       panel.appendChild(deliver);
       grid.appendChild(panel);
@@ -351,6 +386,168 @@
           `${entry.action.replace(/_/g, " ")} — ${entry.display_name || entry.user_id} ` +
           `at ${entry.created_at}`),
       ));
+    }
+
+    // Who is coming: the list a host works from, and the two things that can
+    // happen to a booking once the party arrives — or does not.
+    const guests = await api(
+      `/restaurants/${encodeURIComponent(restaurantId)}/reservations`);
+    if (guests.ok) {
+      const panel = element("section", "panel console-card");
+      panel.dataset.testid = "guest-list";
+      panel.appendChild(element("h2", "label", "Who is coming"));
+      panel.appendChild(element("p", "hint",
+        `${guests.payload.from} to ${guests.payload.to}, in ${restaurant.timezone}`));
+      if (!guests.payload.reservations.length) {
+        panel.appendChild(element("p", "hint", "Nobody booked for these dates yet."));
+      }
+      const list = element("ul", "console-list");
+      guests.payload.reservations.forEach((booking) => {
+        const item = element("li");
+        const labels = booking.table_ids.map((id) => {
+          const found = restaurant.tables.find((table) => table.id === id);
+          return found ? found.label : id;
+        }).join(" + ");
+        item.appendChild(element("span", null,
+          `${booking.starts_at_local.slice(0, 16).replace("T", " ")} · ` +
+          `${booking.party_size} at ${labels} · ` +
+          `${booking.diner_name || booking.diner_email || "unknown"} · `));
+        item.appendChild(element("strong", null, booking.status));
+        if (booking.status === "confirmed") {
+          item.appendChild(actionButton("No-show", () => act(
+            status,
+            `/reservations/${encodeURIComponent(booking.reference)}/no-show`,
+            {method: "POST"},
+            (payload) => {
+              const kept = payload.captured_cents
+                ? ` and kept ${money(payload.captured_cents, payload.currency)}`
+                : "";
+              drawConsole(restaurantId, {
+                message: `Recorded a no-show for ${booking.reference}${kept}.`,
+                kind: "uncertain",
+              });
+            },
+          )));
+          item.appendChild(actionButton("Party came", () => act(
+            status,
+            `/reservations/${encodeURIComponent(booking.reference)}/complete`,
+            {method: "POST"},
+            (payload) => {
+              const released = payload.deposit_released
+                ? " The deposit was released back to the diner." : "";
+              drawConsole(restaurantId, {
+                message: `Marked ${booking.reference} as done.${released}`,
+                kind: "success",
+              });
+            },
+          )));
+        }
+        list.appendChild(item);
+      });
+      panel.appendChild(list);
+      grid.appendChild(panel);
+    }
+
+    // Deposits: whether they are on, and the one form that changes that.
+    const deposits = await api(
+      `/restaurants/${encodeURIComponent(restaurantId)}/payment-settings`);
+    if (deposits.ok) {
+      const panel = element("section", "panel console-card");
+      panel.dataset.testid = "deposits-panel";
+      panel.appendChild(element("h2", "label", "Deposits"));
+      if (deposits.payload.deposits) {
+        panel.appendChild(element("p", "hint",
+          `${money(deposits.payload.deposit_per_seat_cents,
+                   deposits.payload.currency)} per seat for parties of ` +
+          `${deposits.payload.deposit_from_party_size} or more.`));
+        panel.appendChild(actionButton("Stop taking deposits", () => act(
+          status,
+          `/restaurants/${encodeURIComponent(restaurantId)}/payment-settings`,
+          {method: "DELETE"},
+          () => drawConsole(restaurantId, {
+            message: "Deposits are off. Holds already taken are unchanged.",
+            kind: "success",
+          }),
+        )));
+      } else {
+        panel.appendChild(element("p", "hint",
+          "No deposit is taken. A hold is only asked for when you set one here."));
+        const form = element("form", "console-grid");
+        form.dataset.testid = "deposits-form";
+        const fields = [
+          {name: "currency", label: "Currency", type: "text", value: "EUR"},
+          {name: "deposit_per_seat_cents", label: "Cents per seat", type: "number", value: 1000},
+          {name: "deposit_from_party_size", label: "From party size", type: "number", value: 4},
+        ];
+        const inputs = {};
+        fields.forEach((field) => {
+          // `deposit_per_seat_cents` is the API's name for it; the page's own id
+          // is `deposit-per-seat-cents`, so a test or a stylesheet does not have
+          // to know whose spelling it is looking at.
+          const slug = field.name.replace(/^deposit_/, "").replace(/_/g, "-");
+          const wrap = element("div", "field");
+          const control = element("input", "control");
+          control.type = field.type;
+          control.name = field.name;
+          control.value = field.value;
+          control.setAttribute("data-testid", `deposit-${slug}`);
+          const label = element("label", "label", field.label);
+          label.setAttribute("for", `deposit-${slug}`);
+          control.id = `deposit-${slug}`;
+          wrap.appendChild(label);
+          wrap.appendChild(control);
+          form.appendChild(wrap);
+          inputs[field.name] = control;
+        });
+        const submit = element("button", "button button-primary button-small",
+          "Take a deposit");
+        submit.type = "submit";
+        submit.setAttribute("data-testid", "publish-deposit");
+        form.appendChild(submit);
+        form.addEventListener("submit", (event) => {
+          event.preventDefault();
+          const body = {
+            currency: inputs.currency.value.trim().toUpperCase(),
+            deposit_per_seat_cents: Number(inputs.deposit_per_seat_cents.value),
+            deposit_from_party_size: Number(inputs.deposit_from_party_size.value),
+          };
+          act(status,
+            `/restaurants/${encodeURIComponent(restaurantId)}/payment-settings`,
+            {method: "PUT", body},
+            () => drawConsole(restaurantId, {
+              message: "Deposits are on. New bookings will ask for a card.",
+              kind: "success",
+            }));
+        });
+        panel.appendChild(form);
+      }
+      grid.appendChild(panel);
+    }
+
+    // Last month's numbers, so the console answers the question the report
+    // endpoint was built for without anybody composing a query by hand.
+    const bounds = monthBounds(restaurant.timezone);
+    const report = await api(
+      `/restaurants/${encodeURIComponent(restaurantId)}/reports/summary` +
+      `?from=${bounds.from}&to=${bounds.to}`);
+    if (report.ok) {
+      const panel = element("section", "panel console-card");
+      panel.dataset.testid = "report-panel";
+      panel.appendChild(element("h2", "label", "This month"));
+      const covers = report.payload.covers;
+      const takings = report.payload.money;
+      [
+        `${report.payload.bookings.total} bookings · ` +
+        `${report.payload.bookings.cancelled} cancelled · ` +
+        `${report.payload.bookings.no_show} no-shows`,
+        `${covers.served} covers served · ${Math.round(covers.utilisation * 100)}% of ` +
+        `${covers.available} possible`,
+        takings.deposits_published
+          ? `${money(takings.captured_cents, takings.currency)} of deposits kept · ` +
+            `${takings.declined} card(s) refused`
+          : "No deposits taken this month",
+      ].forEach((line) => panel.appendChild(element("p", "hint", line)));
+      grid.appendChild(panel);
     }
 
     // Plans are proposed and applied by the API, and a manager's client reads

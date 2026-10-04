@@ -36,6 +36,7 @@ from . import (
     notifications,
     onboarding,
     parsing,
+    payments,
     service,
     testhooks,
     webui,
@@ -114,6 +115,10 @@ def create_app(
     # own suite can assert what a diner would have received without a mail server
     # existing anywhere.
     app.state.transport = notifications.SmtpTransport.from_env(os.environ)
+    # The payments provider, configured the same way and for the same reason: a
+    # deployment with a Stripe key talks to Stripe, and one without takes holds in
+    # the process so the whole deposit path can be driven end to end.
+    app.state.payments_provider = payments.provider_from_env(os.environ)
     app.state.recorder = notifications.RecordingTransport()
     app.state.serve_test_hooks = serve_test_hooks
 
@@ -224,6 +229,43 @@ def create_app(
         """
         user = authenticate(request)
         return service.session_info(database(request), user["user_id"], user["token"])
+
+    @app.post("/auth/password-reset")
+    def post_password_reset(
+        request: Request, body: bytes = Depends(raw_body)
+    ) -> Response:
+        """Ask for a reset link. Always 202, whatever was sent.
+
+        Deliberately not 404 for an unknown address: this endpoint must not be
+        usable to find out which of a restaurant's guests have accounts here.
+        """
+        parsed = parsing.parse_object(body)
+        return JsonResponse(
+            status_code=202,
+            content=service.request_password_reset(database(request), body=parsed),
+        )
+
+    @app.post("/auth/password-reset/confirm")
+    def post_password_reset_confirm(
+        request: Request, body: bytes = Depends(raw_body)
+    ) -> dict:
+        parsed = parsing.parse_object(body)
+        return service.confirm_password_reset(database(request), body=parsed)
+
+    @app.post("/auth/verify-email")
+    def post_verify_email(
+        request: Request, body: bytes = Depends(raw_body)
+    ) -> dict:
+        """Confirm an address with the code from the message."""
+        parsed = parsing.parse_object(body)
+        return service.confirm_email_verification(database(request), body=parsed)
+
+    @app.post("/auth/verify-email/resend")
+    def post_verify_email_resend(request: Request) -> dict:
+        user = authenticate(request)
+        return service.request_email_verification(
+            database(request), user_id=user["user_id"]
+        )
 
     @app.post("/auth/logout")
     def post_logout(request: Request) -> dict:
@@ -340,7 +382,101 @@ def create_app(
             database(request), user_id=user["user_id"], restaurant_id=restaurant_id
         )
 
+    # -- what a restaurant charges to hold a table ------------------------ #
+    @app.get("/restaurants/{restaurant_id}/payment-settings")
+    def get_payment_settings(request: Request, restaurant_id: str) -> dict:
+        """The deposit this restaurant publishes. Anybody who works here may read it."""
+        user = authenticate(request)
+        return service.get_payment_settings(
+            database(request), user_id=user["user_id"], restaurant_id=restaurant_id
+        )
+
+    @app.put("/restaurants/{restaurant_id}/payment-settings")
+    def put_payment_settings(
+        request: Request, restaurant_id: str, body: bytes = Depends(raw_body)
+    ) -> dict:
+        """Publish a deposit, or change the one already published."""
+        parsed = parsing.parse_object(body)
+        user = authenticate(request)
+        return service.put_payment_settings(
+            database(request),
+            user_id=user["user_id"],
+            restaurant_id=restaurant_id,
+            body=parsed,
+        )
+
+    @app.delete("/restaurants/{restaurant_id}/payment-settings")
+    def delete_payment_settings(request: Request, restaurant_id: str) -> dict:
+        """Stop asking for deposits. Holds already taken stay exactly as they are."""
+        user = authenticate(request)
+        return service.clear_payment_settings(
+            database(request), user_id=user["user_id"], restaurant_id=restaurant_id
+        )
+
+    # -- the party came, or did not --------------------------------------- #
+    @app.post("/reservations/{reference}/no-show")
+    def post_no_show(request: Request, reference: str) -> dict:
+        """Record a no-show and keep the deposit the diner left."""
+        user = authenticate(request)
+        return service.mark_no_show(
+            database(request), user_id=user["user_id"], reference=reference,
+            provider=request.app.state.payments_provider,
+        )
+
+    @app.post("/reservations/{reference}/complete")
+    def post_complete(request: Request, reference: str) -> dict:
+        """The party came: release the hold on their card."""
+        user = authenticate(request)
+        return service.mark_complete(
+            database(request), user_id=user["user_id"], reference=reference,
+            provider=request.app.state.payments_provider,
+        )
+
+    @app.get("/reservations/{reference}/payments")
+    def get_payments(request: Request, reference: str) -> dict:
+        """Every hold on a booking and what happened to it."""
+        user = authenticate(request)
+        return service.reservation_payments(
+            database(request), user_id=user["user_id"], reference=reference
+        )
+
     # -- what the restaurant has told its diners -------------------------- #
+    @app.get("/restaurants/{restaurant_id}/reports/summary")
+    def get_report_summary(request: Request, restaurant_id: str) -> dict:
+        """Covers, cancellations, no-shows, timing, table use and money taken."""
+        user = authenticate(request)
+        return service.restaurant_summary(
+            database(request), user_id=user["user_id"], restaurant_id=restaurant_id,
+            params=dict(request.query_params),
+        )
+
+    @app.get("/restaurants/{restaurant_id}/reports/bookings.csv")
+    def get_report_csv(request: Request, restaurant_id: str) -> Response:
+        """The same window as a CSV, for whoever keeps the spreadsheet."""
+        user = authenticate(request)
+        body = service.restaurant_bookings_csv(
+            database(request), user_id=user["user_id"], restaurant_id=restaurant_id,
+            params=dict(request.query_params),
+        )
+        return Response(
+            content=body,
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": 'attachment; filename="bookings.csv"'
+            },
+        )
+
+    @app.get("/restaurants/{restaurant_id}/reservations")
+    def get_restaurant_reservations(request: Request, restaurant_id: str) -> dict:
+        """Who is coming, in the restaurant's own dates. Staff only."""
+        user = authenticate(request)
+        return service.restaurant_reservations(
+            database(request),
+            user_id=user["user_id"],
+            restaurant_id=restaurant_id,
+            params=dict(request.query_params),
+        )
+
     @app.get("/restaurants/{restaurant_id}/notifications")
     def get_notifications(request: Request, restaurant_id: str) -> dict:
         """The outbox: what has been written, what went out, what did not."""
@@ -476,6 +612,7 @@ def create_app(
             body=parsed,
             method="POST",
             path="/reservations",
+            provider=request.app.state.payments_provider,
         )
         return JsonResponse(status_code=status, content=payload)
 
@@ -522,7 +659,8 @@ def create_app(
         return JsonResponse(
             status_code=200,
             content=service.cancel_reservation(
-                database(request), user["user_id"], reference
+                database(request), user["user_id"], reference,
+                provider=request.app.state.payments_provider,
             ),
         )
 

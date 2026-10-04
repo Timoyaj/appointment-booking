@@ -543,6 +543,16 @@ def drain(client, headers):
     return assert_ok(client.post("/_test/notifications/drain", headers=headers), 200)
 
 
+def guest_messages(delivered):
+    """What a booking sent the guests, out of everything the drain delivered.
+
+    Signing up also sends the new account a confirmation of its own address,
+    which is that person's business and belongs to no restaurant; the counts in
+    these tests are about what a booking tells a diner.
+    """
+    return [m for m in delivered["messages"] if m["kind"] != "email_verification"]
+
+
 def manager_headers(client):
     """Ada is this restaurant's manager; the outbox is hers to read."""
     return headers_for(assert_ok(client.post("/auth/login", json={
@@ -589,11 +599,13 @@ def test_a_confirmation_is_written_when_a_booking_is_made(client, managed):
     assert message["status"] == "queued"
 
     delivered = drain(client, manager_headers(client))
-    assert delivered["result"] == {"configured": True, "sent": 1, "failed": 0, "queued": 0}
-    assert delivered["messages"][0]["kind"] == "booking_confirmed"
-    assert "Zum Anker" in delivered["messages"][0]["subject"]
-    assert reference in delivered["messages"][0]["body"]
-    assert "4 guests" in delivered["messages"][0]["body"]
+    assert delivered["result"]["queued"] == 0 and delivered["result"]["failed"] == 0
+    messages = guest_messages(delivered)
+    assert len(messages) == 1
+    assert messages[0]["kind"] == "booking_confirmed"
+    assert "Zum Anker" in messages[0]["subject"]
+    assert reference in messages[0]["body"]
+    assert "4 guests" in messages[0]["body"]
 
 
 def test_a_retried_booking_sends_one_message(client, seeded):
@@ -605,7 +617,7 @@ def test_a_retried_booking_sends_one_message(client, seeded):
     assert client.post("/reservations", json=body, headers=headers).status_code == 201
     assert client.post("/reservations", json=body, headers=headers).status_code == 200
     delivered = drain(client, manager_headers(client))
-    assert delivered["result"]["sent"] == 1
+    assert len(guest_messages(delivered)) == 1
 
 
 def test_cancelling_amending_and_moving_each_tell_the_diner(client, managed):
@@ -630,10 +642,11 @@ def test_cancelling_amending_and_moving_each_tell_the_diner(client, managed):
     # Two bookings confirmed, one amended, one moved, one cancelled: five real
     # changes, and exactly one message for each.
     delivered = drain(client, manager_headers(client))
-    assert delivered["result"]["sent"] == 5
-    assert delivered["messages"][-1]["kind"] == "booking_cancelled"
-    assert "cancelled" in delivered["messages"][-1]["subject"].lower()
-    kinds = [m["kind"] for m in delivered["messages"]]
+    messages = guest_messages(delivered)
+    assert len(messages) == 5
+    assert messages[-1]["kind"] == "booking_cancelled"
+    assert "cancelled" in messages[-1]["subject"].lower()
+    kinds = [m["kind"] for m in messages]
     assert kinds.count("booking_confirmed") == 2
     assert kinds.count("booking_changed") == 2
 

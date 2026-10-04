@@ -137,6 +137,36 @@ await api("/reservations", {
   },
 });
 
+// A booking this week, so the console's guest list — which shows the coming week
+// — has somebody in it. The restaurant serves on Thursdays, so this is the next
+// Thursday in its own zone.
+function nextThursday() {
+  const now = new Date();
+  const here = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Berlin", year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(now);
+  const daysAhead = (4 - new Date(`${here}T12:00:00Z`).getUTCDay() + 7) % 7;
+  const target = new Date(`${here}T12:00:00Z`);
+  target.setUTCDate(target.getUTCDate() + daysAhead);
+  return target.toISOString().slice(0, 10);
+}
+
+const thisWeek = await api("/reservations", {
+  method: "POST", token: diner.token, key: `console-week-${Date.now()}`,
+  body: {
+    restaurant_id: restaurantId, table_id: "t_2",
+    starts_at_local: `${nextThursday()}T19:00`, party_size: 4,
+  },
+});
+assert.equal(thisWeek.status, 201, `could not book this week: ${JSON.stringify(thisWeek.payload)}`);
+const weekReference = thisWeek.payload.reference;
+
+/** The first button in a panel whose text is exactly `label`. */
+function button(dom, label) {
+  return Array.from(dom.window.document.querySelectorAll("#console-body button"))
+    .find((node) => node.textContent.trim() === label);
+}
+
 await scenario("the console loads your restaurants into the picker", async () => {
   const dom = await loadPage("/console", {token: owner.token, script: "/assets/console.js"});
   const picker = dom.window.document.getElementById("restaurant-picker");
@@ -163,7 +193,12 @@ await scenario("the outbox says what is waiting rather than claiming it was sent
   });
   const body = text(dom, "#console-body");
   assert.ok(body.includes("Messages to diners"), "the outbox panel is drawn");
-  assert.ok(/1 waiting/.test(body), `expected one waiting message, got: ${body.slice(0, 400)}`);
+  // What the page says is waiting is what the API says is waiting: two bookings
+  // were made above, so two messages are queued.
+  const outbox = await api(`/restaurants/${restaurantId}/notifications`, {token: owner.token});
+  const queued = outbox.payload.summary.queued;
+  assert.ok(body.includes(`${queued} waiting`),
+    `the page disagrees with the API about ${queued} waiting: ${body.slice(0, 400)}`);
   assert.ok(body.includes("Booking confirmed"), "the message's subject is shown");
   dom.window.close();
 });
@@ -180,6 +215,74 @@ await scenario("a signed-out visitor is asked to sign in", async () => {
   const dom = await loadPage("/console", {script: "/assets/console.js"});
   const status = text(dom, "#console-status");
   assert.ok(/sign in/i.test(status), `status was: ${status}`);
+  dom.window.close();
+});
+
+await scenario("the console lists who is coming and records a no-show", async () => {
+  const dom = await loadPage(`/console?restaurant_id=${restaurantId}`, {
+    token: owner.token, script: "/assets/console.js",
+  });
+  const body = text(dom, "#console-body");
+  assert.ok(body.includes("Who is coming"), "the guest list is drawn");
+  assert.ok(body.includes("Diner"), `the diner's name is on it: ${body.slice(0, 600)}`);
+  assert.ok(body.includes("4 at 2"), "the party and its table are shown");
+
+  const mark = button(dom, "No-show");
+  assert.ok(mark, "a confirmed booking offers a no-show button");
+  mark.click();
+  await settle(dom);
+  const status = text(dom, "#console-status");
+  assert.ok(/no-show/i.test(status), `status was: ${status}`);
+
+  const after = await api(`/restaurants/${restaurantId}/reservations`, {token: owner.token});
+  const entry = after.payload.reservations.find((r) => r.reference === weekReference);
+  assert.ok(entry, "the booking is still on the restaurant's list");
+  assert.equal(entry.status, "no_show", "the service recorded it");
+  dom.window.close();
+});
+
+await scenario("a manager publishes a deposit and stops it again", async () => {
+  const dom = await loadPage(`/console?restaurant_id=${restaurantId}`, {
+    token: owner.token, script: "/assets/console.js",
+  });
+  const document = dom.window.document;
+  assert.ok(text(dom, "#console-body").includes("No deposit is taken"),
+    "a restaurant taking no deposit says so");
+
+  document.getElementById("deposit-currency").value = "eur";
+  document.getElementById("deposit-per-seat-cents").value = "1500";
+  document.getElementById("deposit-from-party-size").value = "4";
+  document.querySelector('[data-testid="deposits-form"]').dispatchEvent(
+    new dom.window.Event("submit", {bubbles: true, cancelable: true}),
+  );
+  await settle(dom);
+  const published = await api(`/restaurants/${restaurantId}/payment-settings`, {
+    token: owner.token,
+  });
+  assert.equal(published.payload.deposits, true, "the deposit was published");
+  assert.equal(published.payload.deposit_per_seat_cents, 1500);
+  assert.ok(text(dom, "#console-body").includes("per seat"),
+    "the console now shows the terms");
+  assert.ok(text(dom, "#console-body").includes("15.00 EUR"),
+    "and the amount as money, not as cents");
+
+  button(dom, "Stop taking deposits").click();
+  await settle(dom);
+  const stopped = await api(`/restaurants/${restaurantId}/payment-settings`, {
+    token: owner.token,
+  });
+  assert.equal(stopped.payload.deposits, false, "the deposit was withdrawn");
+  dom.window.close();
+});
+
+await scenario("the console shows this month's numbers", async () => {
+  const dom = await loadPage(`/console?restaurant_id=${restaurantId}`, {
+    token: owner.token, script: "/assets/console.js",
+  });
+  const body = text(dom, "#console-body");
+  assert.ok(body.includes("This month"), "the report panel is drawn");
+  assert.ok(/covers served/.test(body), `the covers line is missing: ${body.slice(0, 800)}`);
+  assert.ok(/% of/.test(body), "utilisation is reported as a percentage");
   dom.window.close();
 });
 

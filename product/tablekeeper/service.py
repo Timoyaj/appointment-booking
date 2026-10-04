@@ -34,25 +34,31 @@ import sqlite3
 from collections.abc import Sequence
 from datetime import timedelta, timezone
 
-from . import domain, history, idempotency, parsing, planning, policies, repo
+from . import domain, history, idempotency, parsing, payments, planning, policies, repo
+from . import tztime
 from . import notifications
 from .clock import now
 from .db import Database
 from .errors import (
     ApiError,
     already_in_series,
+    card_declined,
     cutoff_passed,
+    email_not_verified,
     forbidden,
     malformed_request,
     no_feasible_plan,
     not_found,
+    payment_required,
     plan_already_applied,
     reservation_cancelled,
+    reservation_not_editable,
     stale_plan,
     stale_revision,
     table_unavailable,
     validation_failed,
 )
+from . import recovery
 from .tztime import overlaps, parse_instant, parse_local, rfc3339
 
 MAX_MOVES = 8
@@ -166,48 +172,276 @@ def _place(
 # POST /reservations
 # --------------------------------------------------------------------------- #
 def create_reservation(
-    db: Database, *, user_id: str, key: str, body: dict, method: str, path: str
+    db: Database, *, user_id: str, key: str, body: dict, method: str, path: str,
+    provider=None,
 ) -> tuple[int, dict]:
-    """Book a table. Idempotent under ``key``; returns (status, body)."""
+    """Book a table. Idempotent under ``key``; returns (status, body).
+
+    When the restaurant asks for a deposit on this party size, the hold is taken
+    as part of the same transaction — after the table is placed and before the
+    booking is written into the retry ledger — so a declined card leaves no
+    booking behind. The refusal is then recorded outside that transaction, which
+    rolls back: a decline written inside it would be undone by the rollback it
+    describes, exactly like a failed sign-in.
+    """
+    # Named before the transaction so the refusal handler below can read what the
+    # request was about even when validation is what raised.
+    restaurant_id: str | None = None
+    party_size: int | None = None
+    try:
+        with db.transaction() as conn:
+            stored = idempotency.lookup(
+                conn, user_id=user_id, key=key, method=method, path=path, body=body
+            )
+            if stored is not None:
+                return 200, stored["response_body"]
+
+            # A restaurant that has asked for confirmed addresses will not seat a
+            # diner whose address is not confirmed yet. Off unless the deployment
+            # turns it on, because an address that cannot receive mail would
+            # otherwise lock a paying diner out of a restaurant they can walk into.
+            if recovery.require_verified_email() and not recovery.is_verified(conn, user_id):
+                raise email_not_verified(
+                    "Confirm your email address before booking: check your inbox for "
+                    "the message we sent when you signed up"
+                )
+
+            # Field validation happens after idempotency resolution, as specified:
+            # a used key with a different body is a conflict even when that body is
+            # invalid, so the key is judged before the fields are.
+            restaurant_id = parsing.id_field(body, "restaurant_id")
+            table_ids = parsing.table_set_field(body)
+            starts_at_local = parsing.local_time_field(body)
+            party_size = parsing.party_size_field(body)
+            payment_method_id = parsing.payment_method_field(body)
+
+            record = _place(
+                conn,
+                user_id=user_id,
+                restaurant_id=restaurant_id,  # type: ignore[arg-type]
+                table_ids=table_ids,  # type: ignore[arg-type]
+                starts_at_local=starts_at_local,
+                party_size=party_size,  # type: ignore[arg-type]
+            )
+            restaurant = domain.require_restaurant(conn, record["restaurant_id"])
+            _take_deposit(
+                conn,
+                provider=provider or payments.FakeProvider(),
+                restaurant=restaurant,
+                user_id=user_id,
+                record=record,
+                payment_method_id=payment_method_id,
+            )
+            response = domain.reservation_body(record)
+            _notify(
+                conn,
+                restaurant=restaurant,
+                kind=notifications.CONFIRMED,
+                record=record,
+            )
+            idempotency.record(
+                conn,
+                user_id=user_id,
+                key=key,
+                method=method,
+                path=path,
+                body=body,
+                status_code=201,
+                response_body=response,
+            )
+            return 201, response
+    except ApiError as error:
+        if error.status == 402 and restaurant_id is not None:
+            _record_payment_failure(
+                db,
+                restaurant_id=restaurant_id,
+                user_id=user_id,
+                outcome=(
+                    "no_payment_method" if error.code == "payment_required" else "declined"
+                ),
+                amount=payments.deposit_for(
+                    _settings_of(db, restaurant_id), int(party_size or 0)
+                ),
+                reason=error.message,
+            )
+        raise
+
+
+def _settings_of(db: Database, restaurant_id: str) -> dict | None:
+    with db.read() as conn:
+        return repo.payment_settings_for(conn, restaurant_id)
+
+
+def _record_payment_failure(
+    db: Database, *, restaurant_id: str, user_id: str, amount: int, reason: str,
+    outcome: str,
+) -> None:
+    """Note a deposit that could not be taken, in a transaction of its own.
+
+    The booking was rolled back, so there is nothing else left to say that a card
+    failed on a Friday — and that is a thing a restaurant wants to know.
+    """
     with db.transaction() as conn:
-        stored = idempotency.lookup(
-            conn, user_id=user_id, key=key, method=method, path=path, body=body
+        repo.insert_payment_attempt(
+            conn,
+            {
+                "restaurant_id": restaurant_id,
+                "reference": None,
+                "user_id": user_id,
+                "amount_cents": amount,
+                "outcome": outcome,
+                "reason": reason,
+                "created_at": rfc3339(now()),
+            },
         )
-        if stored is not None:
-            return 200, stored["response_body"]
 
-        # Field validation happens after idempotency resolution, as specified.
-        restaurant_id = parsing.id_field(body, "restaurant_id")
-        table_ids = parsing.table_set_field(body)
-        starts_at_local = parsing.local_time_field(body)
-        party_size = parsing.party_size_field(body)
 
-        record = _place(
-            conn,
-            user_id=user_id,
-            restaurant_id=restaurant_id,  # type: ignore[arg-type]
-            table_ids=table_ids,  # type: ignore[arg-type]
-            starts_at_local=starts_at_local,
-            party_size=party_size,  # type: ignore[arg-type]
+def _refuse_uneditable(record: dict) -> None:
+    """Refuse a booking that is no longer the diner's to change.
+
+    A cancelled booking is nobody's, and a no-show is a fact about the past: the
+    party did not come, so there is nothing left to amend, move or adopt. Both are
+    409s, with different codes, because a client that treated them the same would
+    tell a diner their booking was cancelled when it was not.
+    """
+    if record["status"] == "cancelled":
+        raise reservation_cancelled()
+    if record["status"] == "no_show":
+        raise reservation_not_editable(
+            "That booking was recorded as a no-show and can no longer be changed"
         )
-        response = domain.reservation_body(record)
-        _notify(
-            conn,
-            restaurant=domain.require_restaurant(conn, record["restaurant_id"]),
-            kind=notifications.CONFIRMED,
-            record=record,
+
+
+def _take_deposit(
+    conn: sqlite3.Connection,
+    *,
+    provider,
+    restaurant: domain.Restaurant,
+    user_id: str,
+    record: dict,
+    payment_method_id: str | None,
+) -> dict | None:
+    """Hold the deposit this booking owes, inside the booking's own transaction.
+
+    Called after the table is placed and before the booking is acknowledged. A
+    hold that cannot be taken **raises**, which rolls the booking back: a table is
+    not held by somebody whose card was declined, and the diner is told why before
+    they think they have a table.
+
+    Returns the payment block the response carries, or None when this restaurant
+    asks for no deposit.
+    """
+    settings = repo.payment_settings_for(conn, restaurant.id)
+    amount = payments.deposit_for(settings, int(record["party_size"]))
+    if amount <= 0:
+        return None
+    if not payment_method_id:
+        raise payment_required(
+            f"This restaurant holds "
+            f"{payments.format_money(amount, settings['currency'])} for a party of "
+            f"{record['party_size']} or more; send a 'payment_method_id' to hold "
+            f"the table"
         )
-        idempotency.record(
-            conn,
-            user_id=user_id,
-            key=key,
-            method=method,
-            path=path,
-            body=body,
-            status_code=201,
-            response_body=response,
-        )
-        return 201, response
+    result = provider.authorize(
+        amount_cents=amount,
+        currency=settings["currency"],
+        payment_method_id=payment_method_id,
+        # Keyed to the booking attempt, so a retried request holds once.
+        idempotency_key=f"booking:{record['reference']}",
+    )
+    if not result.ok:
+        raise card_declined(result.error or "The card was declined")
+
+    created_at = rfc3339(now())
+    intent_id = payments.new_intent_id()
+    repo.insert_payment_intent(
+        conn,
+        {
+            "id": intent_id,
+            "restaurant_id": restaurant.id,
+            "reference": record["reference"],
+            "user_id": user_id,
+            "provider": provider.name,
+            "provider_ref": result.provider_ref,
+            "currency": settings["currency"],
+            "amount_cents": amount,
+            "captured_cents": 0,
+            "status": payments.AUTHORIZED,
+            "created_at": created_at,
+            "updated_at": created_at,
+        },
+    )
+    payments.record_event(
+        conn, intent_id=intent_id, kind=payments.AUTHORIZED, amount_cents=amount,
+        detail={"provider_ref": result.provider_ref},
+    )
+    return {
+        "currency": settings["currency"],
+        "amount_cents": amount,
+        "status": payments.AUTHORIZED,
+        "intent_id": intent_id,
+    }
+
+
+def _release_deposit(
+    conn: sqlite3.Connection, *, provider, reference: str, reason: str
+) -> dict | None:
+    """Give back anything held on a booking. Used on cancel and on completion.
+
+    A hold that the provider refuses to release is left `authorized` rather than
+    marked released: the ledger must not claim money was given back when it was
+    not, and a manager can see it and ask the provider about it.
+    """
+    intent = repo.intent_for_reference(conn, reference)
+    if intent is None:
+        return None
+    result = provider.release(provider_ref=intent["provider_ref"])
+    if not result.ok:
+        return None
+    repo.update_intent_status(
+        conn, intent["id"], status=payments.RELEASED,
+        captured_cents=int(intent["captured_cents"]), updated_at=rfc3339(now()),
+    )
+    payments.record_event(
+        conn, intent_id=intent["id"], kind=payments.RELEASED,
+        amount_cents=int(intent["amount_cents"]), detail={"reason": reason},
+    )
+    return {"intent_id": intent["id"], "status": payments.RELEASED}
+
+
+def _capture_deposit(
+    conn: sqlite3.Connection, *, provider, reference: str, reason: str
+) -> dict | None:
+    """Keep the deposit: the party did not turn up, so the hold becomes a charge."""
+    intent = repo.intent_for_reference(conn, reference)
+    if intent is None:
+        return None
+    amount = int(intent["amount_cents"])
+    result = provider.capture(provider_ref=intent["provider_ref"], amount_cents=amount)
+    if not result.ok:
+        raise card_declined(result.error or "The hold could not be captured")
+    repo.update_intent_status(
+        conn, intent["id"], status=payments.CAPTURED, captured_cents=amount,
+        updated_at=rfc3339(now()),
+    )
+    payments.record_event(
+        conn, intent_id=intent["id"], kind=payments.CAPTURED, amount_cents=amount,
+        detail={"reason": reason},
+    )
+    return {"intent_id": intent["id"], "status": payments.CAPTURED, "captured_cents": amount}
+
+
+def _payment_block(conn: sqlite3.Connection, reference: str) -> dict | None:
+    """What a booking response says about money, when there is anything to say."""
+    intent = repo.intent_for_reference(conn, reference)
+    if intent is None:
+        return None
+    return {
+        "currency": intent["currency"],
+        "amount_cents": int(intent["amount_cents"]),
+        "status": intent["status"],
+        "intent_id": intent["id"],
+    }
 
 
 def _notify(
@@ -237,6 +471,210 @@ def _notify(
         labels={table["id"]: table["label"] for table in restaurant.tables},
         extra=extra,
     )
+
+
+def _load_for_manager(
+    conn: sqlite3.Connection, *, user_id: str, reference: str
+) -> tuple[dict, domain.Restaurant]:
+    """A booking for somebody who runs its restaurant, or 404 for everybody else.
+
+    Not a 403: a diner guessing at references must not be able to tell a booking
+    that exists from one that does not, and "you may not touch this" is an answer
+    about existence. Somebody who does work here gets the booking; anybody else
+    gets the same 404 an unknown reference gets.
+    """
+    from . import onboarding
+
+    record = repo.get_reservation_by_reference(conn, reference)
+    if record is None:
+        raise not_found(f"No reservation with reference '{reference}'")
+    restaurant = domain.require_restaurant(conn, record["restaurant_id"])
+    role = onboarding.role_in(
+        conn, user_id=user_id, restaurant_id=record["restaurant_id"]
+    )
+    if role not in (onboarding.OWNER, onboarding.MANAGER):
+        raise not_found(f"No reservation with reference '{reference}'")
+    return record, restaurant
+
+
+def mark_no_show(
+    db: Database, *, user_id: str, reference: str, provider=None
+) -> dict:
+    """Record that the party did not come, and keep the deposit they left.
+
+    The deposit is the point of the whole feature: a table for eight on a Friday
+    that nobody turns up for is money the restaurant has already lost, and the hold
+    taken at booking is what makes some of it back.
+    """
+    with db.transaction() as conn:
+        record, restaurant = _load_for_manager(
+            conn, user_id=user_id, reference=reference
+        )
+        if record["status"] == "no_show":
+            return domain.reservation_body(record)
+        if record["status"] == "cancelled":
+            raise reservation_cancelled()
+
+        captured = _capture_deposit(
+            conn, provider=provider or payments.FakeProvider(), reference=reference,
+            reason="no show",
+        )
+        repo.update_reservation(conn, reference, {"status": "no_show"})
+        history.record(
+            conn,
+            reference=reference,
+            event=history.NO_SHOW,
+            changes=[{"field": "status", "from": record["status"], "to": "no_show"}],
+            revision=int(record["revision"]),
+            accepted_terms=record["accepted_terms"],
+        )
+        repo.bump_restaurant_revision(conn, record["restaurant_id"])
+        updated = repo.get_reservation_by_reference(conn, reference)
+        _notify(
+            conn,
+            restaurant=restaurant,
+            kind=notifications.NO_SHOW_CHARGE,
+            record=updated,  # type: ignore[arg-type]
+            extra={
+                "captured_cents": (captured or {}).get("captured_cents", 0),
+                "currency": (
+                    repo.get_payment_intent(conn, captured["intent_id"])["currency"]
+                    if captured
+                    else None
+                ),
+            },
+        )
+        return domain.reservation_body(updated)  # type: ignore[arg-type]
+
+
+def mark_complete(
+    db: Database, *, user_id: str, reference: str, provider=None
+) -> dict:
+    """The party came. Release the hold — the visit is paid for at the table.
+
+    The booking keeps its status: it happened, which is what `confirmed` has meant
+    all along, and changing it would free a table the party is still sitting at.
+    """
+    with db.transaction() as conn:
+        record, _restaurant = _load_for_manager(
+            conn, user_id=user_id, reference=reference
+        )
+        if record["status"] != "confirmed":
+            raise reservation_not_editable(
+                "Only a confirmed booking can be marked as visited"
+            )
+        released = _release_deposit(
+            conn, provider=provider or payments.FakeProvider(), reference=reference,
+            reason="the party came",
+        )
+        repo.insert_audit(
+            conn,
+            restaurant_id=record["restaurant_id"],
+            user_id=user_id,
+            action="booking_completed",
+            detail=f'{{"reference": "{reference}"}}',
+            created_at=rfc3339(now()),
+        )
+        body = domain.reservation_body(record)
+        if released:
+            body["deposit_released"] = True
+        return body
+
+
+def reservation_payments(
+    db: Database, *, user_id: str, reference: str
+) -> dict:
+    """What money moved on a booking: its holds and the ledger under them.
+
+    Readable by the diner who made it and by the people who run the restaurant —
+    the only audience for whom any of this is their business.
+    """
+    from . import onboarding
+
+    with db.read() as conn:
+        record = repo.get_reservation_by_reference(conn, reference)
+        if record is None:
+            raise not_found(f"No reservation with reference '{reference}'")
+        mine = record["user_id"] == user_id
+        staff = onboarding.role_in(
+            conn, user_id=user_id, restaurant_id=record["restaurant_id"]
+        ) is not None
+        if not mine and not staff:
+            raise not_found(f"No reservation with reference '{reference}'")
+        intents = repo.intents_for_reference(conn, reference)
+        return {
+            "reference": reference,
+            "currency": intents[0]["currency"] if intents else None,
+            "intents": [
+                {
+                    "intent_id": intent["id"],
+                    "status": intent["status"],
+                    "amount_cents": int(intent["amount_cents"]),
+                    "captured_cents": int(intent["captured_cents"]),
+                    "created_at": intent["created_at"],
+                    "events": repo.payment_events_for(conn, intent["id"]),
+                }
+                for intent in intents
+            ],
+        }
+
+
+def get_payment_settings(db: Database, *, user_id: str, restaurant_id: str) -> dict:
+    with db.read() as conn:
+        _require_staff(conn, user_id=user_id, restaurant_id=restaurant_id)
+        return payments.describe(repo.payment_settings_for(conn, restaurant_id))
+
+
+def put_payment_settings(
+    db: Database, *, user_id: str, restaurant_id: str, body: dict
+) -> dict:
+    """Publish a deposit. Manager work, audited like every other manager write."""
+    from . import onboarding
+
+    with db.transaction() as conn:
+        domain.require_restaurant(conn, restaurant_id)
+        if not onboarding.is_manager(conn, user_id=user_id, restaurant_id=restaurant_id):
+            raise forbidden("Only a manager of this restaurant may set its deposits")
+        restaurant = domain.require_restaurant(conn, restaurant_id)
+        settings = payments.validate_settings(body, restaurant.tables)
+        at = rfc3339(now())
+        repo.upsert_payment_settings(
+            conn,
+            restaurant_id=restaurant_id,
+            currency=settings["currency"],
+            deposit_per_seat_cents=settings["deposit_per_seat_cents"],
+            deposit_from_party_size=settings["deposit_from_party_size"],
+            updated_at=at,
+            updated_by=user_id,
+        )
+        repo.insert_audit(
+            conn, restaurant_id=restaurant_id, user_id=user_id,
+            action="deposit_published",
+            detail=(
+                f'{{"per_seat_cents": {settings["deposit_per_seat_cents"]}, '
+                f'"from_party_size": {settings["deposit_from_party_size"]}, '
+                f'"currency": "{settings["currency"]}"}}'
+            ),
+            created_at=at,
+        )
+        repo.bump_restaurant_revision(conn, restaurant_id)
+        return payments.describe(repo.payment_settings_for(conn, restaurant_id))
+
+
+def clear_payment_settings(db: Database, *, user_id: str, restaurant_id: str) -> dict:
+    from . import onboarding
+
+    with db.transaction() as conn:
+        domain.require_restaurant(conn, restaurant_id)
+        if not onboarding.is_manager(conn, user_id=user_id, restaurant_id=restaurant_id):
+            raise forbidden("Only a manager of this restaurant may set its deposits")
+        repo.clear_payment_settings(conn, restaurant_id)
+        repo.insert_audit(
+            conn, restaurant_id=restaurant_id, user_id=user_id,
+            action="deposits_stopped", detail="{}", created_at=rfc3339(now()),
+        )
+        repo.bump_restaurant_revision(conn, restaurant_id)
+        return {"deposits": False}
 
 
 def _note_series_change(conn: sqlite3.Connection, reference: str, *, exception: bool) -> None:
@@ -287,7 +725,7 @@ def get_reservation(db: Database, user_id: str, reference: str) -> dict:
 # --------------------------------------------------------------------------- #
 # POST /reservations/{reference}/cancel
 # --------------------------------------------------------------------------- #
-def cancel_reservation(db: Database, user_id: str, reference: str) -> dict:
+def cancel_reservation(db: Database, user_id: str, reference: str, *, provider=None) -> dict:
     with db.transaction() as conn:
         record, restaurant = _load_owned(conn, user_id, reference)
         if record["status"] == "cancelled":
@@ -315,11 +753,19 @@ def cancel_reservation(db: Database, user_id: str, reference: str) -> dict:
         _note_series_change(conn, reference, exception=False)
         repo.bump_restaurant_revision(conn, record["restaurant_id"])
         updated = repo.get_reservation_by_reference(conn, reference)
+        # A diner who cancels inside the cutoff gets their deposit back: the
+        # table is free and somebody else can have it, so there is nothing to
+        # keep. This runs before the message, so the message can say so.
+        released = _release_deposit(
+            conn, provider=provider or payments.FakeProvider(), reference=reference,
+            reason="cancelled inside the cutoff",
+        )
         _notify(
             conn,
             restaurant=restaurant,
             kind=notifications.CANCELLED,
             record=updated,  # type: ignore[arg-type]
+            extra={"deposit_released": bool(released)},
         )
         return domain.reservation_body(updated)  # type: ignore[arg-type]
 
@@ -342,8 +788,7 @@ def amend_reservation(db: Database, user_id: str, reference: str, body: dict) ->
                 f"Reservation '{reference}' is at revision {record['revision']}, "
                 f"not {expected_revision}"
             )
-        if record["status"] == "cancelled":
-            raise reservation_cancelled()
+        _refuse_uneditable(record)
         # The cutoff is measured against the current start time, before any change,
         # and it is the cutoff the diner accepted when this booking was decided.
         if domain.is_past_cutoff(record, restaurant, now()):
@@ -577,8 +1022,7 @@ def move_reservations(
                     f"Reservation '{record['reference']}' is at revision "
                     f"{record['revision']}, not {expected}"
                 )
-            if record["status"] == "cancelled":
-                raise reservation_cancelled()
+            _refuse_uneditable(record)
             if domain.is_past_cutoff(record, restaurant, now()):
                 raise cutoff_passed()
 
@@ -727,8 +1171,7 @@ def create_series(
         if anchor is None or anchor["user_id"] != user_id:
             raise not_found(f"No reservation with reference '{anchor_reference}'")
         restaurant = domain.require_restaurant(conn, anchor["restaurant_id"])
-        if anchor["status"] == "cancelled":
-            raise reservation_cancelled()
+        _refuse_uneditable(anchor)
         if domain.is_past_cutoff(anchor, restaurant, now()):
             raise cutoff_passed()
         if repo.series_of_reservation(conn, anchor_reference) is not None:
@@ -1007,9 +1450,14 @@ def signup(db: Database, body: dict) -> dict:
 
     auth.validate_credentials(email=email, password=password, display_name=display_name)
     with db.transaction() as conn:
-        return auth.signup(
+        created = auth.signup(
             conn, email=email, password=password, display_name=display_name
         )
+        # The confirmation link is written with the account, in the same
+        # transaction: an account that exists is an account whose address we are
+        # waiting to hear about.
+        recovery.send_verification(conn, user_id=created["user_id"])
+        return created
 
 
 def login(db: Database, body: dict) -> dict:
@@ -1047,10 +1495,15 @@ def session_info(db: Database, user_id: str, token: str) -> dict:
     with db.read() as conn:
         user = repo.get_user(conn, user_id)
         record = repo.get_session(conn, token)
+        # Read inside the same snapshot as everything else here: one answer about
+        # one caller, taken at one moment.
+        verified = recovery.is_verified(conn, user_id)
+
     return {
         "user_id": user_id,
         "display_name": user["display_name"] if user else None,
         "email": user["email"] if user else None,
+        "email_verified": verified,
         # A token issued before sessions existed has no expiry, which is a fact
         # about it rather than a missing field.
         "expires_at": record["expires_at"] if record else None,
@@ -1094,6 +1547,59 @@ def _require_staff(conn: sqlite3.Connection, *, user_id: str, restaurant_id: str
     domain.require_restaurant(conn, restaurant_id)
     if onboarding.role_in(conn, user_id=user_id, restaurant_id=restaurant_id) is None:
         raise not_found(f"No restaurant with id '{restaurant_id}'")
+
+
+def restaurant_reservations(
+    db: Database, *, user_id: str, restaurant_id: str, params: dict
+) -> dict:
+    """A restaurant's bookings for a window, as its own staff see them.
+
+    The report says how many covers were served; this says who they are, which is
+    what a host standing at the door needs. `from` and `to` default to today and
+    the next six days in the restaurant's own calendar, because the console asks
+    for "this week" without knowing the timezone arithmetic.
+    """
+    from . import reports as reports_module
+
+    with db.read() as conn:
+        _require_staff(conn, user_id=user_id, restaurant_id=restaurant_id)
+        restaurant = domain.require_restaurant(conn, restaurant_id)
+        if params.get("from") is None and params.get("to") is None:
+            today = now().astimezone(tztime.zone(restaurant.timezone)).date()
+            start, end = today, today + timedelta(days=6)
+        else:
+            start, end = reports_module.window(params)
+        records = repo.reservations_for_restaurant(
+            conn,
+            restaurant_id,
+            start=start.isoformat(),
+            end=(end + timedelta(days=1)).isoformat(),
+        )
+        return {
+            "restaurant_id": restaurant_id,
+            "from": start.isoformat(),
+            "to": end.isoformat(),
+            "reservations": [
+                {
+                    "reference": record["reference"],
+                    "status": record["status"],
+                    "starts_at_local": record["starts_at_local"],
+                    "party_size": int(record["party_size"]),
+                    "table_ids": record["table_ids"],
+                    "table_id": record["table_id"],
+                    "created_at": record["created_at"],
+                    "revision": int(record["revision"]),
+                    "diner_name": record.get("diner_name"),
+                    "diner_email": record.get("diner_email"),
+                    "cancellation_cutoff_minutes": int(
+                        (record.get("accepted_terms") or {}).get(
+                            "cancellation_cutoff_minutes", 0
+                        )
+                    ),
+                }
+                for record in records
+            ],
+        }
 
 
 def list_notifications(db: Database, *, user_id: str, restaurant_id: str) -> dict:
@@ -1142,10 +1648,15 @@ def retry_notification(
 def drain_notifications(
     db: Database, *, user_id: str, restaurant_id: str, transport=None
 ) -> dict:
-    """Send what is waiting. Reports honestly when nothing can be sent."""
+    """Send what is waiting for this restaurant. Reports honestly when nothing can.
+
+    Scoped to the restaurant the caller works at: a manager sending their guest
+    list is sending their own post, not the platform's address confirmations or
+    another restaurant's cancellations.
+    """
     with db.read() as conn:
         _require_staff(conn, user_id=user_id, restaurant_id=restaurant_id)
-    result = notifications.drain(db, transport)
+    result = notifications.drain(db, transport, restaurant_id=restaurant_id)
     return result
 
 
@@ -1542,3 +2053,93 @@ def reservation_decision(db: Database, user_id: str | None, reference: str) -> d
             "revision": int(record["revision"]),
             "accepted_terms": record["accepted_terms"],
         }
+
+
+# --------------------------------------------------------------------------- #
+# reports
+# --------------------------------------------------------------------------- #
+def restaurant_summary(
+    db: Database, *, user_id: str, restaurant_id: str, params: dict
+) -> dict:
+    """How the room has been doing, over a window of the restaurant's calendar."""
+    from . import reports
+
+    with db.read() as conn:
+        _require_staff(conn, user_id=user_id, restaurant_id=restaurant_id)
+        restaurant = domain.require_restaurant(conn, restaurant_id)
+        start, end = reports.window(params)
+        return reports.summary(conn, restaurant, start=start, end=end, params=params)
+
+
+def restaurant_bookings_csv(
+    db: Database, *, user_id: str, restaurant_id: str, params: dict
+) -> str:
+    from . import reports
+
+    with db.read() as conn:
+        _require_staff(conn, user_id=user_id, restaurant_id=restaurant_id)
+        restaurant = domain.require_restaurant(conn, restaurant_id)
+        start, end = reports.window(params)
+        return reports.bookings_csv(conn, restaurant, start=start, end=end)
+
+
+# --------------------------------------------------------------------------- #
+# getting back in
+# --------------------------------------------------------------------------- #
+def request_password_reset(db: Database, *, body: dict) -> dict:
+    """Ask for a reset link.
+
+    Always the same answer, whether or not that address has an account here: an
+    endpoint that says "no such user" is an endpoint for finding out who a
+    restaurant's guests are.
+    """
+    email = body.get("email")
+    if email is None:
+        raise validation_failed("'email' is required")
+    if not isinstance(email, str):
+        raise malformed_request("'email' must be a string")
+    with db.transaction() as conn:
+        recovery.request_reset(conn, email=email)
+    return {
+        "requested": True,
+        "message": (
+            "If that address has an account, a reset link is on its way to it."
+        ),
+    }
+
+
+def confirm_password_reset(db: Database, *, body: dict) -> dict:
+    token = body.get("token")
+    new_password = body.get("new_password")
+    if not isinstance(token, str) or not token:
+        raise validation_failed("'token' is required")
+    if new_password is None:
+        raise validation_failed("'new_password' is required")
+    with db.transaction() as conn:
+        return recovery.confirm_reset(conn, token=token, new_password=new_password)
+
+
+def request_email_verification(db: Database, *, user_id: str) -> dict:
+    """Send another confirmation link, or report that the address is already confirmed."""
+    with db.transaction() as conn:
+        if recovery.is_verified(conn, user_id):
+            return {"sent": False, "email_verified": True}
+        recovery.send_verification(conn, user_id=user_id)
+        return {"sent": True, "email_verified": False}
+
+
+def confirm_email_verification(db: Database, *, body: dict) -> dict:
+    token = body.get("token")
+    if not isinstance(token, str) or not token:
+        raise validation_failed("'token' is required")
+    with db.transaction() as conn:
+        return recovery.confirm_verification(conn, token=token)
+
+
+def email_is_verified(db: Database, user_id: str) -> bool:
+    with db.read() as conn:
+        return recovery.is_verified(conn, user_id)
+
+
+def require_verified_email() -> bool:
+    return recovery.require_verified_email()

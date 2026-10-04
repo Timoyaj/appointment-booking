@@ -75,6 +75,19 @@ def test_the_console_script_is_served_from_the_image(client, seeded):
     assert "/notifications" in response.text
 
 
+def test_the_console_script_drives_the_managers_new_screens(client, seeded):
+    """Deposits, tonight's list and the month's numbers are on the console.
+
+    The panels are built in the browser from the API, so what the route can prove
+    is that the served script is the one that talks to those endpoints — the DOM
+    checks behind `tools/console-check.mjs` prove the rest against a live service.
+    """
+    script = client.get("/assets/console.js").text
+    for endpoint in ("/payment-settings", "/no-show", "/complete",
+                     "/reports/summary", "/reservations"):
+        assert endpoint in script, endpoint
+
+
 def test_the_console_does_not_shadow_the_api(client, seeded):
     """Screens are served after the API, so no endpoint can be hidden by a page."""
     assert client.get("/restaurants").headers["content-type"].startswith(

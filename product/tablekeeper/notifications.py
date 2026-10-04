@@ -29,6 +29,7 @@ from typing import Any, Protocol
 
 from . import repo
 from .clock import now
+from .payments import format_money
 from .tztime import rfc3339
 
 # The kinds of message this service writes. A manager digest and a reminder are
@@ -39,6 +40,9 @@ CHANGED = "booking_changed"
 CANCELLED = "booking_cancelled"
 SEATING_CHANGED = "seating_changed"
 SERIES_ADOPTED = "series_adopted"
+NO_SHOW_CHARGE = "no_show_charge"
+PASSWORD_RESET = "password_reset"
+EMAIL_VERIFICATION = "email_verification"
 
 MAX_ATTEMPTS = 5
 
@@ -126,6 +130,12 @@ def _new_id() -> str:
     return f"n_{secrets.token_hex(12)}"
 
 
+def _money(cents: int, currency: str) -> str:
+    """Cents as a person reads them. Imported here rather than duplicating the
+    rule: there is one way this service writes an amount of money."""
+    return format_money(cents, currency)
+
+
 def _table_labels(record: dict, labels: dict[str, str]) -> str:
     table_ids = list(record.get("table_ids") or [record["table_id"]])
     return ", ".join(labels.get(table_id, table_id) for table_id in table_ids)
@@ -152,11 +162,53 @@ def _compose(
     size = f"{party} {'guest' if party == 1 else 'guests'}"
 
     if kind == CANCELLED:
+        context = extra or {}
+        money = ""
+        if context.get("deposit_released"):
+            money = (
+                "\n\nThe deposit you paid to hold the table has been released back "
+                "to your card."
+            )
         return (
             f"Your booking at {restaurant_name} is cancelled",
             f"Booking {reference} at {restaurant_name} on {when} for {size} has been "
-            f"cancelled.\n\nIf this was not you, reply to this message and we will "
-            f"look into it.",
+            f"cancelled.{money}\n\nIf this was not you, reply to this message and we "
+            f"will look into it.",
+        )
+    if kind in (PASSWORD_RESET, EMAIL_VERIFICATION):
+        # These two are not about a booking at all, so they are written plainly
+        # and carry the link the message is for.
+        context = extra or {}
+        token = context.get("token", "")
+        minutes = int(context.get("ttl_minutes") or 60)
+        if kind == PASSWORD_RESET:
+            return (
+                "Reset your Tablekeeper password",
+                f"Somebody asked to reset the password for this address.\n\n"
+                f"Use this code to choose a new one:\n\n    {token}\n\n"
+                f"It works for {minutes} minutes and only once. If this was not you, "
+                f"nothing has changed and you can ignore this message.",
+            )
+        return (
+            "Confirm your Tablekeeper email address",
+            f"Use this code to confirm this address:\n\n    {token}\n\n"
+            f"It works for {minutes} minutes and only once.",
+        )
+    if kind == NO_SHOW_CHARGE:
+        context = extra or {}
+        amount = int(context.get("captured_cents") or 0)
+        money = (
+            f"\n\nThe deposit of "
+            f"{_money(amount, str(context.get('currency') or ''))} has been kept, as "
+            f"the terms of this booking said it would be."
+            if amount
+            else "\n\nNo deposit was held on this booking."
+        )
+        return (
+            f"We missed you at {restaurant_name}",
+            f"Booking {reference} for {when} for {size} was recorded as a no-show, "
+            f"because the table was still waiting for you.{money}\n\nIf we have this "
+            f"wrong, reply to this message and we will put it right.",
         )
     if kind == SEATING_CHANGED:
         return (
@@ -249,7 +301,7 @@ def for_reference(conn: sqlite3.Connection, reference: str) -> list[dict]:
 # sending
 # --------------------------------------------------------------------------- #
 def drain(
-    db, transport: Transport | None, *, limit: int = 50
+    db, transport: Transport | None, *, limit: int = 50, restaurant_id: str | None = None
 ) -> dict[str, Any]:
     """Hand queued messages to the transport. Never raises for one bad message.
 
@@ -259,7 +311,9 @@ def drain(
     """
     if transport is None:
         with db.read() as conn:
-            queued = repo.pending_notifications(conn, limit=limit)
+            queued = repo.pending_notifications(
+                conn, limit=limit, restaurant_id=restaurant_id
+            )
         return {
             "configured": False,
             "sent": 0,
@@ -270,7 +324,9 @@ def drain(
     sent = 0
     failed = 0
     with db.transaction() as conn:
-        for message in repo.pending_notifications(conn, limit=limit):
+        for message in repo.pending_notifications(
+            conn, limit=limit, restaurant_id=restaurant_id
+        ):
             try:
                 transport.send(message)
             except Exception as error:  # a transport failure is data, not a crash
@@ -280,8 +336,14 @@ def drain(
                 failed += 1
                 continue
             repo.mark_notification_sent(conn, message["id"], sent_at=rfc3339(now()))
+            if message["kind"] in (PASSWORD_RESET, EMAIL_VERIFICATION):
+                # The link was a credential while it was waiting to be delivered;
+                # now that it has been, the database does not need to hold it.
+                repo.scrub_notification_body(conn, message["id"])
             sent += 1
-        remaining = repo.pending_notifications(conn, limit=limit)
+        remaining = repo.pending_notifications(
+            conn, limit=limit, restaurant_id=restaurant_id
+        )
     return {
         "configured": True,
         "sent": sent,

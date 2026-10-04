@@ -40,6 +40,10 @@ def forbidden(detail: str = "Not permitted to access this resource") -> ApiError
     return ApiError(403, "forbidden", detail)
 
 
+def email_not_verified(detail: str = "Confirm your email address first") -> ApiError:
+    return ApiError(403, "email_not_verified", detail)
+
+
 # --- 404 ------------------------------------------------------------------ #
 def not_found(detail: str = "No such resource") -> ApiError:
     return ApiError(404, "not_found", detail)
@@ -109,6 +113,26 @@ def cutoff_passed() -> ApiError:
 
 def reservation_cancelled() -> ApiError:
     return ApiError(409, "reservation_cancelled", "That reservation is cancelled")
+
+
+def reservation_not_editable(detail: str = "That reservation can no longer be changed") -> ApiError:
+    return ApiError(409, "reservation_not_editable", detail)
+
+
+def already_completed(detail: str = "That reservation has already been settled") -> ApiError:
+    return ApiError(409, "already_completed", detail)
+
+
+# --- 402 ------------------------------------------------------------------ #
+# The one status this service uses for "the booking is fine, the money is not".
+# A deposit cannot be authorized because none was offered, or because the card
+# said no; the table is not the problem, so it is not a 4xx about the table.
+def payment_required(detail: str = "This booking requires a deposit") -> ApiError:
+    return ApiError(402, "payment_required", detail)
+
+
+def card_declined(detail: str = "The card was declined") -> ApiError:
+    return ApiError(402, "card_declined", detail)
 
 
 # --- 422 ------------------------------------------------------------------ #

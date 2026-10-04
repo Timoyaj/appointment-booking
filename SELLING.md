@@ -3,25 +3,40 @@
 An assessment of the four stage folders against what a restaurant would actually pay
 money for. Code references are to `stage-4/`, since it is the widest build.
 
-> **Status: the first pass is built.** See [`product/`](product/README.md) for the
-> layer that now sits on top of the engine — the same service, carried forward the
-> way each stage was carried forward, with **955 tests** (887 of them unchanged).
-> What that first pass closed:
+> **Status: tier 1 is built.** See [`product/`](product/README.md) for the layer
+> that now sits on top of the engine — the same service, carried forward the way
+> each stage was carried forward, with **1026 tests** (887 of them unchanged).
+> What is closed, in the order this document ranked it:
 >
 > - **§2.1 — the data-wipe endpoint.** `/_test/*` is now off in the shipped image,
 >   not merely discouraged. *(done)*
 > - **§2.3 + §2.5 — token expiry, revocation, log-out, login throttling.** *(done)*
 > - **§3.1 — restaurant onboarding and the manager console, roles included.** *(done:
->   `POST /restaurants`, owner/manager/host, `/start`, `/console`, audit trail)*
-> - **§3.2 — the notification outbox.** *(done: confirmations, changes, cancellations
->   and reseating messages are written inside the booking's own transaction, with
->   retries, a visible failure state, and an SMTP transport that a deployment turns on)*
+>   `POST /restaurants`, owner/manager/host, `/start`, `/console`, audit trail, and
+>   now the guest list, deposits, this month's numbers and no-show/complete on the
+>   console itself)*
+> - **§3.2 — the notification outbox.** *(done: confirmations, changes, cancellations,
+>   reseating, address confirmations and reset links are written inside the
+>   transaction they belong to, with retries, a visible failure state, and an SMTP
+>   transport a deployment turns on)*
 > - **§2.2 — persistence.** *(partly: the image now keeps its database in a volume
 >   instead of `/tmp`, so a restart is not an erasure; Postgres is still ahead)*
+> - **§3.3 — deposits.** *(done: a manager publishes a per-seat deposit from a
+>   threshold party size; the hold is taken inside the booking transaction, a
+>   decline leaves no booking, no-show captures and complete/cancel release, and an
+>   append-only ledger records all of it. Stripe behind an env var, and an
+>   in-process provider without one)*
+> - **§3.5 — reporting.** *(done: covers, utilisation against published hours,
+>   no-show and cancellation rates, lead time, by hour/day/party size, table use,
+>   money kept — plus a CSV a restaurant can open in a spreadsheet)*
+> - **§2.4 — password reset and email verification.** *(done: reset always answers
+>   202 and signs every device out, links are single-use and stored hashed, and
+>   signup confirms the address; enforcement of confirmed addresses is one env var)*
 >
-> Still open, in the order they matter: **payments** (§3.3), **reporting** (§3.5),
-> password reset and email verification (§2.4), the mutating manager flows as
-> screens rather than API calls, and hosting/backups/observability (§2.7).
+> Still open, in the order they matter: reminders (§3.4), amend/cancel by the link
+> in the email, the waitlist, the mutating manager flows (policies, plans) as
+> screens rather than API calls, and hosting/backups/observability (§2.7) plus the
+> licence and data-retention policy (§2.6).
 
 ---
 

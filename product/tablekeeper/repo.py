@@ -38,6 +38,13 @@ STATE_TABLES: tuple[str, ...] = (
     "login_attempts",
     "notifications",
     "audit_log",
+    "restaurant_payment_settings",
+    "payment_intents",
+    "payment_events",
+    "payment_attempts",
+    "password_resets",
+    "email_verifications",
+    "email_verified",
 )
 
 
@@ -370,6 +377,28 @@ def list_reservations_for_user(conn: sqlite3.Connection, user_id: str) -> list[d
         "SELECT * FROM reservations WHERE user_id = ? "
         "ORDER BY starts_at_utc DESC, created_at DESC, id DESC",
         (user_id,),
+    )
+    members = tables_for_references(conn, [r["reference"] for r in records])
+    return [_decorate(r, members) for r in records]  # type: ignore[return-value]
+
+
+def reservations_for_restaurant(
+    conn: sqlite3.Connection, restaurant_id: str, *, start: str, end: str
+) -> list[dict]:
+    """One restaurant's bookings over a range of its own local dates.
+
+    The diner is joined on because this is the list a host works from: a table of
+    four at seven is not actionable unless somebody can also see whose name is on
+    it. A booking whose account has been removed keeps its row and loses the name,
+    which is the honest answer.
+    """
+    records = rows(
+        conn,
+        "SELECT r.*, u.email AS diner_email, u.display_name AS diner_name "
+        "FROM reservations r LEFT JOIN users u ON u.id = r.user_id "
+        "WHERE r.restaurant_id = ? AND r.starts_at_local >= ? AND r.starts_at_local < ? "
+        "ORDER BY r.starts_at_local, r.reference",
+        (restaurant_id, start, end),
     )
     members = tables_for_references(conn, [r["reference"] for r in records])
     return [_decorate(r, members) for r in records]  # type: ignore[return-value]
@@ -975,6 +1004,20 @@ def insert_notification(conn: sqlite3.Connection, data: dict) -> None:
     )
 
 
+def scrub_notification_body(conn: sqlite3.Connection, notification_id: str) -> None:
+    """Drop the text of a message that has already gone out.
+
+    A confirmation message is a record; a password reset is a working credential
+    sitting in a table. Once the transport has taken the message there is no
+    reason to keep its body, so a snapshot taken afterwards cannot be used to
+    reset somebody's password. A message that *failed* keeps its body, because
+    retrying it has to send the same message.
+    """
+    conn.execute(
+        "UPDATE notifications SET body = '' WHERE id = ?", (notification_id,)
+    )
+
+
 def list_notifications(
     conn: sqlite3.Connection, restaurant_id: str, *, status: str | None = None,
     limit: int = 100,
@@ -1009,16 +1052,27 @@ def notifications_for_reference(conn: sqlite3.Connection, reference: str) -> lis
     )
 
 
-def pending_notifications(conn: sqlite3.Connection, *, limit: int = 50) -> list[dict]:
+def pending_notifications(
+    conn: sqlite3.Connection, *, limit: int = 50, restaurant_id: str | None = None
+) -> list[dict]:
     """Queued messages, oldest first, so the outbox is drained in order.
 
     `rowid` is insertion order, which is the order the changes happened in and
-    therefore the order a diner should read them.
+    therefore the order a diner should read them. A `restaurant_id` narrows it to
+    one restaurant's own post — the platform's account mail (address confirmations,
+    password resets) belongs to no restaurant and is drained on its own.
     """
+    if restaurant_id is None:
+        return rows(
+            conn,
+            "SELECT * FROM notifications WHERE status = 'queued' ORDER BY rowid LIMIT ?",
+            (limit,),
+        )
     return rows(
         conn,
-        "SELECT * FROM notifications WHERE status = 'queued' ORDER BY rowid LIMIT ?",
-        (limit,),
+        "SELECT * FROM notifications WHERE status = 'queued' AND restaurant_id = ? "
+        "ORDER BY rowid LIMIT ?",
+        (restaurant_id, limit),
     )
 
 
@@ -1066,3 +1120,244 @@ def count_notifications(
             (restaurant_id, status),
         ).fetchone()
     return int(found["n"]) if found else 0
+
+
+# --------------------------------------------------------------------------- #
+# payments
+# --------------------------------------------------------------------------- #
+def payment_settings_for(conn: sqlite3.Connection, restaurant_id: str) -> dict | None:
+    """The deposit this restaurant publishes, or None when it takes none."""
+    return row(
+        conn,
+        "SELECT * FROM restaurant_payment_settings WHERE restaurant_id = ?",
+        (restaurant_id,),
+    )
+
+
+def upsert_payment_settings(
+    conn: sqlite3.Connection,
+    *,
+    restaurant_id: str,
+    currency: str,
+    deposit_per_seat_cents: int,
+    deposit_from_party_size: int,
+    updated_at: str,
+    updated_by: str,
+) -> None:
+    conn.execute(
+        "INSERT INTO restaurant_payment_settings (restaurant_id, currency, "
+        " deposit_per_seat_cents, deposit_from_party_size, updated_at, updated_by) "
+        "VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(restaurant_id) DO UPDATE SET currency = excluded.currency, "
+        " deposit_per_seat_cents = excluded.deposit_per_seat_cents, "
+        " deposit_from_party_size = excluded.deposit_from_party_size, "
+        " updated_at = excluded.updated_at, updated_by = excluded.updated_by",
+        (
+            restaurant_id,
+            currency,
+            int(deposit_per_seat_cents),
+            int(deposit_from_party_size),
+            updated_at,
+            updated_by,
+        ),
+    )
+
+
+def clear_payment_settings(conn: sqlite3.Connection, restaurant_id: str) -> None:
+    """Stop taking deposits. Bookings already held keep their holds."""
+    conn.execute(
+        "DELETE FROM restaurant_payment_settings WHERE restaurant_id = ?",
+        (restaurant_id,),
+    )
+
+
+def insert_payment_intent(conn: sqlite3.Connection, data: dict) -> None:
+    conn.execute(
+        "INSERT INTO payment_intents (id, restaurant_id, reference, user_id, provider, "
+        " provider_ref, currency, amount_cents, captured_cents, status, created_at, "
+        " updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            data["id"],
+            data["restaurant_id"],
+            data["reference"],
+            data["user_id"],
+            data["provider"],
+            data["provider_ref"],
+            data["currency"],
+            int(data["amount_cents"]),
+            int(data.get("captured_cents", 0)),
+            data["status"],
+            data["created_at"],
+            data["updated_at"],
+        ),
+    )
+
+
+def get_payment_intent(conn: sqlite3.Connection, intent_id: str) -> dict | None:
+    return row(conn, "SELECT * FROM payment_intents WHERE id = ?", (intent_id,))
+
+
+def intent_for_reference(
+    conn: sqlite3.Connection, reference: str
+) -> dict | None:
+    """The live hold on a booking: the one that has not been captured or released.
+
+    A booking can carry more than one intent over its life — a released hold from
+    a cancelled attempt, and the one that counts — so the one that still holds
+    money is the one every operation names.
+    """
+    return row(
+        conn,
+        "SELECT * FROM payment_intents WHERE reference = ? "
+        "AND status = 'authorized' ORDER BY rowid DESC LIMIT 1",
+        (reference,),
+    )
+
+
+def intents_for_reference(conn: sqlite3.Connection, reference: str) -> list[dict]:
+    return rows(
+        conn,
+        "SELECT * FROM payment_intents WHERE reference = ? ORDER BY rowid",
+        (reference,),
+    )
+
+
+def update_intent_status(
+    conn: sqlite3.Connection, intent_id: str, *, status: str, captured_cents: int,
+    updated_at: str,
+) -> None:
+    conn.execute(
+        "UPDATE payment_intents SET status = ?, captured_cents = ?, updated_at = ? "
+        "WHERE id = ?",
+        (status, int(captured_cents), updated_at, intent_id),
+    )
+
+
+def payment_events_for(conn: sqlite3.Connection, intent_id: str) -> list[dict]:
+    """The ledger for one hold, oldest first: what was held, taken or given back."""
+    return rows(
+        conn,
+        "SELECT kind, amount_cents, detail, created_at FROM payment_events "
+        "WHERE intent_id = ? ORDER BY id",
+        (intent_id,),
+    )
+
+
+def insert_payment_attempt(conn: sqlite3.Connection, data: dict) -> None:
+    conn.execute(
+        "INSERT INTO payment_attempts (restaurant_id, reference, user_id, amount_cents, "
+        " outcome, reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            data["restaurant_id"],
+            data.get("reference"),
+            data["user_id"],
+            int(data["amount_cents"]),
+            data["outcome"],
+            data.get("reason"),
+            data["created_at"],
+        ),
+    )
+
+
+def payment_attempts_for(conn: sqlite3.Connection, restaurant_id: str) -> list[dict]:
+    return rows(
+        conn,
+        "SELECT * FROM payment_attempts WHERE restaurant_id = ? ORDER BY id DESC",
+        (restaurant_id,),
+    )
+
+
+def captured_cents_for_restaurant(
+    conn: sqlite3.Connection, restaurant_id: str, *, from_date: str, to_date: str
+) -> int:
+    """Money actually taken, by the day the booking was for."""
+    found = conn.execute(
+        "SELECT COALESCE(SUM(i.captured_cents), 0) AS taken FROM payment_intents i "
+        "JOIN reservations r ON r.reference = i.reference "
+        "WHERE i.restaurant_id = ? AND r.starts_at_local >= ? "
+        "AND r.starts_at_local < ?",
+        (restaurant_id, f"{from_date}", f"{to_date}~"),
+    ).fetchone()
+    return int(found["taken"]) if found else 0
+
+
+# --------------------------------------------------------------------------- #
+# account recovery
+# --------------------------------------------------------------------------- #
+def insert_password_reset(
+    conn: sqlite3.Connection, *, token_hash: str, user_id: str, created_at: str,
+    expires_at: str,
+) -> None:
+    conn.execute(
+        "INSERT INTO password_resets (token_hash, user_id, created_at, expires_at, used_at) "
+        "VALUES (?, ?, ?, ?, NULL)",
+        (token_hash, user_id, created_at, expires_at),
+    )
+
+
+def get_password_reset(conn: sqlite3.Connection, token_hash: str) -> dict | None:
+    return row(
+        conn, "SELECT * FROM password_resets WHERE token_hash = ?", (token_hash,)
+    )
+
+
+def clear_password_resets(conn: sqlite3.Connection, user_id: str) -> None:
+    """Drop every outstanding link for an account, used or not."""
+    conn.execute("DELETE FROM password_resets WHERE user_id = ?", (user_id,))
+
+
+def mark_password_reset_used(
+    conn: sqlite3.Connection, token_hash: str, *, used_at: str
+) -> None:
+    conn.execute(
+        "UPDATE password_resets SET used_at = ? WHERE token_hash = ?",
+        (used_at, token_hash),
+    )
+
+
+def update_user_password(conn: sqlite3.Connection, user_id: str, *, password: str) -> None:
+    conn.execute("UPDATE users SET password = ? WHERE id = ?", (password, user_id))
+
+
+def insert_email_verification(
+    conn: sqlite3.Connection, *, token_hash: str, user_id: str, created_at: str,
+    expires_at: str,
+) -> None:
+    conn.execute(
+        "INSERT INTO email_verifications (token_hash, user_id, created_at, expires_at, "
+        " used_at) VALUES (?, ?, ?, ?, NULL)",
+        (token_hash, user_id, created_at, expires_at),
+    )
+
+
+def get_email_verification(conn: sqlite3.Connection, token_hash: str) -> dict | None:
+    return row(
+        conn, "SELECT * FROM email_verifications WHERE token_hash = ?", (token_hash,)
+    )
+
+
+def clear_email_verifications(conn: sqlite3.Connection, user_id: str) -> None:
+    conn.execute("DELETE FROM email_verifications WHERE user_id = ?", (user_id,))
+
+
+def mark_email_verification_used(
+    conn: sqlite3.Connection, token_hash: str, *, used_at: str
+) -> None:
+    conn.execute(
+        "UPDATE email_verifications SET used_at = ? WHERE token_hash = ?",
+        (used_at, token_hash),
+    )
+
+
+def mark_email_verified(
+    conn: sqlite3.Connection, user_id: str, *, verified_at: str
+) -> None:
+    conn.execute(
+        "INSERT INTO email_verified (user_id, verified_at) VALUES (?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET verified_at = excluded.verified_at",
+        (user_id, verified_at),
+    )
+
+
+def email_verified(conn: sqlite3.Connection, user_id: str) -> dict | None:
+    return row(conn, "SELECT * FROM email_verified WHERE user_id = ?", (user_id,))

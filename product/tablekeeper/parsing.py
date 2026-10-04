@@ -318,3 +318,16 @@ def idempotency_key(header: str | None) -> str:
             f"Idempotency-Key must be at most {MAX_IDEMPOTENCY_KEY_LENGTH} characters"
         )
     return header
+
+
+def payment_method_field(body: Mapping[str, Any]) -> str | None:
+    """The provider's handle for the diner's card, when the booking sends one.
+
+    Optional everywhere: a restaurant that takes no deposit never reads it, and a
+    booking that needs one but sends none is refused by the deposit check rather
+    than here, so the diner hears about the money rather than about a field.
+    """
+    return string_field(
+        body, "payment_method_id", required=False, allow_null_as_absent=True,
+        max_length=200,
+    )
