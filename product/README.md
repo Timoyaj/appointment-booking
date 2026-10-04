@@ -132,10 +132,11 @@ cd product
 python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/python -m pytest -q                     # 955 passed
 
-# the diner's screens, driven in a DOM against a running service
-cd tools && npm install jsdom
-node ui-check.mjs      http://127.0.0.1:8080      # 25 passed, 0 failed
-node console-check.mjs http://127.0.0.1:8080      #  8 passed, 0 failed
+# the screens, driven in a DOM against a running service
+cd tools && npm install
+npm run check:diner     # 25 passed, 0 failed — the four diner screens
+npm run check:console   #  8 passed, 0 failed — the console and onboarding
+npm run check           # both
 ```
 
 The 887 tests that came from `stage-4/` pass unchanged, which is the evidence

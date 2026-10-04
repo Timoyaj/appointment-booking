@@ -19,3 +19,6 @@ data/
 # Local reference material (specs + official checks); never committed
 .ref/
 node_modules/
+
+# npm artefacts from the browser-check harnesses (package.json is kept)
+node_modules/
