@@ -197,6 +197,9 @@
     bookingPartySize: "",   // what the diner typed in the booking form
     booking: {submitting: false, error: null, uncertain: null, confirmation: null, pending: null},
     lookup: {loading: false, error: null, reservation: null, busy: false},
+    // The diner's own list: null until the first fetch answers, so an empty
+    // room is never shown where a loading room is the truth.
+    bookings: {loading: false, error: null, list: null, cancelling: null},
     authError: null,
     cellError: null,        // an available cell clicked while signed out
   };
@@ -236,6 +239,7 @@
     state.session = null;
     state.booking = {submitting: false, error: null, uncertain: null, confirmation: null, pending: null};
     state.lookup = {loading: false, error: null, reservation: null, busy: false};
+    state.bookings = {loading: false, error: null, list: null, cancelling: null};
     render();
   }
 
@@ -781,6 +785,191 @@
   }
 
   // --------------------------------------------------------------------- //
+  // the diner's own list: /bookings
+  // --------------------------------------------------------------------- //
+  // The list is everything GET /reservations returns, split by what still
+  // matters: a confirmed sitting in the future is upcoming (soonest first,
+  // because that is how a diner reads it), everything else — past sittings and
+  // cancellations — keeps the service's own order, newest first.
+  function nowLocalStamp() {
+    const moment = new Date();
+    const pad = (value) => String(value).padStart(2, "0");
+    return `${moment.getFullYear()}-${pad(moment.getMonth() + 1)}-${pad(moment.getDate())}`
+      + `T${pad(moment.getHours())}:${pad(moment.getMinutes())}`;
+  }
+
+  function isUpcoming(reservation) {
+    return reservation.status === "confirmed"
+      && String(reservation.starts_at_local || "") > nowLocalStamp();
+  }
+
+  function restaurantNameOf(restaurantId) {
+    const detail = restaurantCache.get(restaurantId);
+    return (detail && detail.name) || "The restaurant";
+  }
+
+  async function loadBookings() {
+    if (!state.session) { render(); return; }   // the signed-out prompt is drawn from state
+    state.bookings.loading = true;
+    state.bookings.error = null;
+    render();
+    const result = await api("/reservations");
+    state.bookings.loading = false;
+    if (result.lost) {
+      state.bookings.error = "We could not reach the restaurant. Check your connection and try again.";
+    } else if (result.status === 401) {
+      // The session ended elsewhere: fall back to the signed-out view rather
+      // than ask for a list the service will not give.
+      clearSession();
+      state.session = null;
+    } else if (result.ok && result.payload) {
+      state.bookings.list = result.payload.reservations || [];
+      state.bookings.error = null;
+      // Restaurant names travel separately; each one redraws the list as it lands.
+      [...new Set(state.bookings.list.map((reservation) => reservation.restaurant_id))]
+        .forEach((restaurantId) => { restaurantDetail(restaurantId).then(() => render()); });
+    } else {
+      state.bookings.error = wording(result.payload, "Your bookings could not be loaded.");
+    }
+    render();
+  }
+
+  function copyText(text, button) {
+    const mark = () => {
+      if (!button) return;
+      button.textContent = "Copied";
+      window.setTimeout(() => { button.textContent = "Copy"; }, 2000);
+    };
+    try {
+      if (window.navigator.clipboard && typeof window.navigator.clipboard.writeText === "function") {
+        window.navigator.clipboard.writeText(text).then(mark, () => {});
+        return;
+      }
+    } catch (error) { /* the reference stays selectable text */ }
+  }
+
+  function bookingCard(reservation, upcoming) {
+    const reference = reservation.reference;
+    const cancelled = reservation.status === "cancelled";
+    const tableIds = reservation.table_ids || (reservation.table_id ? [reservation.table_id] : []);
+    const actions = [
+      el("a", {
+        class: "button button-quiet button-small",
+        href: `/lookup?reference=${encodeURIComponent(reference)}`,
+        "data-testid": `bookings-open-${reference}`,
+        text: "Open booking",
+      }),
+    ];
+    if (upcoming) actions.push(el("button", {
+      class: "button button-danger button-small",
+      type: "button",
+      "data-testid": `bookings-cancel-${reference}`,
+      disabled: state.bookings.cancelling === reference,
+      text: state.bookings.cancelling === reference ? "Cancelling…" : "Cancel",
+      onclick: () => cancelFromList(reference),
+    }));
+    return el("article", {class: "panel booking-card", "data-testid": `booking-card-${reference}`}, [
+      el("div", {class: "booking-card-head"}, [
+        el("p", {class: "booking-card-when", text: humanWhen(reservation.starts_at_local)}),
+        el("span", {
+          class: `status-pill ${cancelled ? "status-cancelled" : "status-confirmed"}`,
+          text: reservation.status,
+        }),
+      ]),
+      el("p", {
+        class: "booking-card-meta",
+        text: `${restaurantNameOf(reservation.restaurant_id)} · party of ${reservation.party_size}`
+          + ` · ${selectionLabel(tableIds, restaurantCache.get(reservation.restaurant_id))}`,
+      }),
+      el("div", {class: "booking-card-reference-row"}, [
+        el("span", {class: "booking-card-reference", "data-testid": `bookings-reference-${reference}`, text: reference}),
+        el("button", {
+          class: "button button-quiet button-small",
+          type: "button",
+          "data-testid": `bookings-copy-${reference}`,
+          text: "Copy",
+          onclick: (event) => copyText(reference, event.currentTarget),
+        }),
+      ]),
+      el("div", {class: "actions"}, actions),
+    ]);
+  }
+
+  function renderBookings() {
+    const container = byId("bookings");
+    const status = byId("bookings-status");
+    if (!container) return;
+    if (status) replace(status, state.bookings.loading
+      ? [el("div", {class: "panel loading"}, [
+        el("span", {class: "spinner", "aria-hidden": "true"}),
+        el("span", {text: "Fetching your reservations…"})])]
+      : []);
+
+    if (!state.session) {
+      replace(container, [el("div", {class: "panel bookings-signin", "data-testid": "bookings-signin-prompt"}, [
+        el("h2", {text: "Sign in to see your reservations"}),
+        el("p", {text: "Your bookings live on your account. Sign in and they are all here — no reference to type in."}),
+        el("div", {class: "actions"}, [
+          el("a", {class: "button button-primary", href: "/login", text: "Sign in"}),
+          el("a", {class: "button button-quiet", href: "/signup", text: "Create an account"}),
+        ]),
+      ])]);
+      return;
+    }
+    if (state.bookings.error) {
+      replace(container, [
+        notice("error", "bookings-error", state.bookings.error),
+        el("div", {class: "actions"}, [el("button", {
+          class: "button button-quiet",
+          type: "button",
+          "data-testid": "bookings-retry",
+          text: "Try again",
+          onclick: loadBookings,
+        })]),
+      ]);
+      return;
+    }
+    if (state.bookings.list === null) { replace(container, []); return; }
+    if (!state.bookings.list.length) {
+      replace(container, [el("div", {class: "panel empty", "data-testid": "bookings-empty"}, [
+        el("h2", {text: "No reservations yet"}),
+        el("p", {text: "When you book a table it will wait for you here, ready to open, change or cancel."}),
+        el("div", {class: "actions"}, [
+          el("a", {class: "button button-primary", href: "/", text: "Find a table"}),
+        ]),
+      ])]);
+      return;
+    }
+
+    const upcoming = state.bookings.list.filter(isUpcoming)
+      .sort((a, b) => String(a.starts_at_local).localeCompare(String(b.starts_at_local)));
+    const past = state.bookings.list.filter((reservation) => !isUpcoming(reservation));
+    const groups = [];
+    if (upcoming.length) groups.push(el("section", {class: "bookings-group", "data-testid": "bookings-upcoming"},
+      [el("h2", {class: "bookings-group-title", text: "Upcoming"})].concat(upcoming.map((reservation) => bookingCard(reservation, true)))));
+    if (past.length) groups.push(el("section", {class: "bookings-group", "data-testid": "bookings-past"},
+      [el("h2", {class: "bookings-group-title", text: "Past and cancelled"})].concat(past.map((reservation) => bookingCard(reservation, false)))));
+    replace(container, [el("div", {class: "bookings-list", "data-testid": "bookings-list"}, groups)]);
+  }
+
+  async function cancelFromList(reference) {
+    state.bookings.cancelling = reference;
+    state.bookings.error = null;
+    render();
+    const result = await api(`/reservations/${encodeURIComponent(reference)}/cancel`, {method: "POST"});
+    state.bookings.cancelling = null;
+    if (result.lost) {
+      state.bookings.error = "We could not reach the restaurant, so the booking was not cancelled. Try again.";
+    } else if (result.ok && result.payload) {
+      state.bookings.list = (state.bookings.list || [])
+        .map((reservation) => (reservation.reference === reference ? result.payload : reservation));
+    } else {
+      state.bookings.error = wording(result.payload, "That booking could not be cancelled.");
+    }
+    render();
+  }
+
+  // --------------------------------------------------------------------- //
   // signup and login
   // --------------------------------------------------------------------- //
   function renderAuthError() {
@@ -857,6 +1046,7 @@
     renderSession();
     if (state.route === "/") { renderAvailability(); renderBooking(); }
     if (state.route === "/lookup") renderLookup();
+    if (state.route === "/bookings") renderBookings();
     if (state.route === "/signup" || state.route === "/login") renderAuthError();
   }
 
@@ -880,6 +1070,10 @@
         if (state.session) submitLookup(null);
       }
     }
+
+    // The list is the diner's own, so it asks for itself the moment the screen
+    // loads; a signed-out visitor gets the prompt instead.
+    if (state.route === "/bookings") loadBookings();
   }
 
   if (document.readyState === "loading") {

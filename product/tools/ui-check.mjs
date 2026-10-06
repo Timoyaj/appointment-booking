@@ -674,6 +674,129 @@ await scenario("a session signed in before an upgrade survives it", async () => 
   assert.match(tid(document, "confirmation-reference").textContent.trim(), /^[A-Z0-9]{6,12}$/);
 });
 
+await scenario("the bookings screen asks a signed-out visitor to sign in", async () => {
+  await reset();
+  const {document} = await page("/bookings");
+  const prompt = await waitFor(document, "bookings-signin-prompt");
+  assert.ok(prompt.querySelector("a[href='/login']"), "the prompt offers a way to sign in");
+  assert.equal(tid(document, "bookings-list"), null, "no list is drawn for a stranger");
+});
+
+await scenario("the bookings screen shows an empty room before the first booking", async () => {
+  await reset();
+  const {document} = await signedInPage("/bookings");
+  const empty = await waitFor(document, "bookings-empty");
+  assert.ok(empty.querySelector("a[href='/']"), "the empty room points at the search");
+});
+
+await scenario("the bookings screen lists the diner's own bookings, soonest first", async () => {
+  await reset();
+  const session = await tokenFor();
+  const early = await bookDirectly(session.token, {
+    restaurant_id: "r_anker", table_id: "t_1", starts_at_local: `${BOOKING_DATE}T18:00`, party_size: 2});
+  const late = await bookDirectly(session.token, {
+    restaurant_id: "r_anker", table_id: "t_1", starts_at_local: LATER, party_size: 2});
+  assert.equal(early.status, 201, JSON.stringify(early));
+  assert.equal(late.status, 201, JSON.stringify(late));
+
+  // A stranger's booking must never appear on this list.
+  const stranger = await fetch(`${BASE}/auth/signup`, {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({email: "stranger@example.com", password: "long enough", display_name: "Stranger"})});
+  const strangerToken = (await stranger.json()).token;
+  const other = await bookDirectly(strangerToken, {
+    restaurant_id: "r_anker", table_id: "t_3", starts_at_local: AT, party_size: 5});
+  assert.equal(other.status, 201, JSON.stringify(other));
+
+  const {document} = await page("/bookings", {
+    session: {token: session.token, displayName: session.display_name, email: ADA.email}});
+  await waitFor(document, "bookings-list");
+  const upcoming = tid(document, "bookings-upcoming");
+  assert.ok(upcoming, "the confirmed future sittings form the upcoming group");
+  const cards = Array.from(upcoming.querySelectorAll("[data-testid^='booking-card-']"))
+    .map((card) => card.getAttribute("data-testid"));
+  assert.deepEqual(cards,
+    [`booking-card-${early.payload.reference}`, `booking-card-${late.payload.reference}`],
+    "soonest sitting first");
+  assert.ok(tid(document, `bookings-reference-${early.payload.reference}`), "the reference is on the card");
+  assert.equal(tid(document, `bookings-open-${early.payload.reference}`).getAttribute("href"),
+    `/lookup?reference=${early.payload.reference}`, "a card opens its own booking");
+  assert.equal(tid(document, `booking-card-${other.payload.reference}`), null,
+    "another account's booking never appears");
+  // The restaurant's name lands with the card, fetched from the service itself.
+  // Re-query each pass: a redraw replaces the nodes an earlier query held.
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    const group = tid(document, "bookings-upcoming");
+    if (group && /Zum Anker/.test(group.textContent)) break;
+    assert.ok(Date.now() < deadline, "the restaurant name never arrived on the card");
+    await settle(25);
+  }
+});
+
+await scenario("a past sitting sits apart from the upcoming ones", async () => {
+  await reset();
+  const session = await tokenFor();
+  const upcomingBooking = await bookDirectly(session.token, {
+    restaurant_id: "r_anker", table_id: "t_2", starts_at_local: AT, party_size: 4});
+  const cancelled = await bookDirectly(session.token, {
+    restaurant_id: "r_anker", table_id: "t_1", starts_at_local: LATER, party_size: 2});
+  assert.equal(upcomingBooking.status, 201);
+  assert.equal(cancelled.status, 201);
+  const response = await fetch(`${BASE}/reservations/${cancelled.payload.reference}/cancel`, {
+    method: "POST", headers: {Authorization: `Bearer ${session.token}`}});
+  assert.equal(response.status, 200);
+
+  const {document} = await page("/bookings", {
+    session: {token: session.token, displayName: "Ada", email: ADA.email}});
+  await waitFor(document, "bookings-list");
+  const past = tid(document, "bookings-past");
+  assert.ok(past, "cancelled bookings form the past group");
+  assert.ok(past.querySelector(`[data-testid='booking-card-${cancelled.payload.reference}']`));
+  assert.equal(past.querySelector(`[data-testid='bookings-cancel-${cancelled.payload.reference}']`),
+    null, "a cancelled booking offers no cancel button");
+  const upcomingGroup = tid(document, "bookings-upcoming");
+  assert.equal(
+    upcomingGroup.querySelector(`[data-testid='booking-card-${cancelled.payload.reference}']`),
+    null, "a cancelled booking leaves the upcoming group");
+});
+
+await scenario("a booking can be cancelled from the list", async () => {
+  await reset();
+  const session = await tokenFor();
+  const booked = await bookDirectly(session.token, {
+    restaurant_id: "r_anker", table_id: "t_2", starts_at_local: AT, party_size: 4});
+  assert.equal(booked.status, 201);
+  const reference = booked.payload.reference;
+
+  const {window, document} = await page("/bookings", {
+    session: {token: session.token, displayName: "Ada", email: ADA.email}});
+  await waitFor(document, "bookings-list");
+  assert.ok(tid(document, `bookings-cancel-${reference}`), "an upcoming booking offers its cancel");
+  press(window, tid(document, `bookings-cancel-${reference}`));
+
+  // The card moves from upcoming into the past group, wearing its new status.
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    const past = tid(document, "bookings-past");
+    const card = past && past.querySelector(`[data-testid='booking-card-${reference}']`);
+    if (card) {
+      assert.match(card.textContent, /cancelled/);
+      break;
+    }
+    assert.ok(Date.now() < deadline, "the cancelled booking never moved to the past group");
+    await settle(25);
+  }
+  assert.equal(tid(document, `bookings-cancel-${reference}`), null, "the cancel button is gone");
+  const after = await reservationsOf(session.token);
+  assert.equal(after.find((r) => r.reference === reference).status, "cancelled",
+    "the service really cancelled it");
+  // And the table is free again for somebody else.
+  const rebook = await bookDirectly(session.token, {
+    restaurant_id: "r_anker", table_id: "t_2", starts_at_local: AT, party_size: 4});
+  assert.equal(rebook.status, 201, JSON.stringify(rebook));
+});
+
 // --------------------------------------------------------------------------- //
 console.log(`\n${passed} passed, ${failures.length} failed`);
 if (failures.length) {

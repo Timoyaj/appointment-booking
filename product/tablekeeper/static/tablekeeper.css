@@ -451,6 +451,38 @@ table.grid caption { caption-side: top; text-align: left; padding-bottom: var(--
 .status-cancelled { background: var(--taken-soft); color: var(--ink-faint); }
 .reservation .actions { display: flex; flex-wrap: wrap; gap: var(--space-3); margin-top: var(--space-2); }
 
+/* --- the diner's own list (/bookings) ------------------------------------- */
+.screen-bookings { max-width: 44rem; margin: 0 auto; width: 100%; }
+.bookings { display: flex; flex-direction: column; gap: var(--space-5); }
+.bookings-list { display: flex; flex-direction: column; gap: var(--space-5); }
+.bookings-group { display: flex; flex-direction: column; gap: var(--space-3); }
+.bookings-group-title {
+  font-family: var(--serif);
+  font-size: 1.15rem;
+  font-weight: 600;
+  margin: 0;
+  padding-bottom: var(--space-1);
+  border-bottom: 1px solid var(--line);
+}
+
+.booking-card { display: flex; flex-direction: column; gap: var(--space-3); }
+.booking-card-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3); justify-content: space-between; }
+.booking-card-when { font-family: var(--serif); font-size: 1.12rem; font-weight: 600; margin: 0; }
+.booking-card-meta { margin: 0; color: var(--ink-soft); font-size: 0.94rem; }
+.booking-card-reference-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3); }
+.booking-card-reference {
+  font-family: var(--serif);
+  letter-spacing: 0.12em;
+  font-weight: 600;
+  font-size: 1.05rem;
+}
+.booking-card .actions { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-top: var(--space-1); }
+
+.bookings-signin { display: flex; flex-direction: column; gap: var(--space-3); border-top: 4px solid var(--accent); }
+.bookings-signin h2 { font-family: var(--serif); font-size: 1.4rem; margin: 0; font-weight: 600; }
+.bookings-signin p { margin: 0; color: var(--ink-soft); }
+.bookings-signin .actions, .bookings .empty .actions { display: flex; flex-wrap: wrap; gap: var(--space-3); margin-top: var(--space-2); }
+
 /* --- narrow screens -------------------------------------------------------- */
 @media (max-width: 44rem) {
   .main { padding: var(--space-5) var(--space-3) var(--space-6); }

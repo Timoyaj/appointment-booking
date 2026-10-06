@@ -5,7 +5,7 @@ money for. Code references are to `stage-4/`, since it is the widest build.
 
 > **Status: tier 1 is built.** See [`product/`](product/README.md) for the layer
 > that now sits on top of the engine — the same service, carried forward the way
-> each stage was carried forward, with **1026 tests** (887 of them unchanged).
+> each stage was carried forward, with **1041 tests** (887 of them unchanged).
 > What is closed, in the order this document ranked it:
 >
 > - **§2.1 — the data-wipe endpoint.** `/_test/*` is now off in the shipped image,
@@ -32,6 +32,9 @@ money for. Code references are to `stage-4/`, since it is the widest build.
 > - **§2.4 — password reset and email verification.** *(done: reset always answers
 >   202 and signs every device out, links are single-use and stored hashed, and
 >   signup confirms the address; enforcement of confirmed addresses is one env var)*
+> - On top of the ranked work: **a diner can now see their own bookings** at
+>   `/bookings` — upcoming sittings soonest first, no reference needed, cancel
+>   from the list — and the date picker no longer offers past days. *(done)*
 >
 > Still open, in the order they matter: reminders (§3.4), amend/cancel by the link
 > in the email, the waitlist, the mutating manager flows (policies, plans) as

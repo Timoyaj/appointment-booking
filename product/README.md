@@ -13,10 +13,11 @@ open http://localhost:8080/console
 ```
 
 Everything the engine did, it still does, byte for byte: same routes, same error
-codes, same screens, same export format. **1026 tests pass** — the 887 it arrived
-with, plus 139 for the product layer: sessions, onboarding, roles, the outbox and
+codes, same screens, same export format. **1041 tests pass** — the 887 it arrived
+with, plus 154 for the product layer: sessions, onboarding, roles, the outbox and
 audit trail (53), the two new screens (16), deposits (30), reporting (22), account
-recovery (14) and the snapshot round-trip for the new tables (4).
+recovery (14), the snapshot round-trip for the new tables (4) and the diner's own
+list of reservations (15).
 
 ---
 
@@ -162,6 +163,34 @@ reports utilisation `0.0` rather than dividing by zero.
   the outbox once the transport has taken it, so a snapshot taken afterwards
   cannot be replayed into somebody's account.
 
+### 8. A diner can see their own bookings
+
+Until now a booking could only be reached again by typing its reference — the one
+thing a diner is most likely to lose. `GET /reservations` already answered "what
+has this account booked"; nothing on the screens asked it. Now:
+
+- **`/bookings`** is a fifth diner screen, linked from the masthead of every
+  screen. The server renders the heading and the spaces the list fills; the
+  script draws what only the API knows.
+- A signed-out visitor is **asked to sign in**, not shown an empty room. A
+  signed-in diner with nothing booked sees an empty room that points at the
+  search.
+- The list splits itself: **Upcoming** — confirmed sittings still ahead, soonest
+  first, because that is how a diner reads it — and **Past and cancelled**, in
+  the service's own order. "Still ahead" is judged against the device clock,
+  which is acceptable here: the page is personal, and the device reading it is
+  the diner's own.
+- Each card names the restaurant, the sitting, the party and the tables, carries
+  its reference with a **copy** control, **opens the booking** through the lookup
+  screen, and an upcoming booking can be **cancelled from the list** — the card
+  moves to the past group wearing its new status, and the server is the source
+  of every word of it.
+- The date picker on the search screen now **starts on today and refuses earlier
+  days** (`min` on the input), so a diner is not offered a past they cannot book.
+
+The other side of the room is unchanged: the console, the onboarding and every
+route the engine had read and write exactly as before.
+
 ---
 
 ## What is still not here
@@ -199,11 +228,11 @@ Three layers, all run against a live service:
 ```bash
 cd product
 python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/python -m pytest -q                     # 1026 passed
+.venv/bin/python -m pytest -q                     # 1041 passed
 
 # the screens, driven in a DOM against a running service
 cd tools && npm install
-npm run check:diner     # 25 passed, 0 failed — the four diner screens
+npm run check:diner     # 30 passed, 0 failed — the five diner screens
 npm run check:console   # 11 passed, 0 failed — the console and onboarding
 npm run check           # both
 ```
@@ -212,7 +241,8 @@ The 887 tests that came from `stage-4/` pass unchanged, which is the evidence
 that the product layer is additive: it adds tables and routes and changes no
 answer the earlier stages gave. The new tests are `tests/test_product.py`
 (sessions, throttling, onboarding, roles, the outbox, the audit trail),
-`tests/test_console_screens.py` (the two new screens), `tests/test_payments.py`,
+`tests/test_console_screens.py` (the two new screens),
+`tests/test_bookings_screen.py` (the diner's list), `tests/test_payments.py`,
 `tests/test_reports.py`, `tests/test_recovery.py` and
 `tests/test_product_state.py` (a snapshot round-trip that carries deposits, the
 ledger and a live reset link across).
