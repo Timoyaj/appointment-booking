@@ -31,7 +31,7 @@ curl -s localhost:8080/health
 requests, well inside the 60-second budget (startup is a schema migration of an
 empty SQLite file, typically under a second).
 
-The API and the browser product are one process on one port. The four screens are
+The API and the browser product are one process on one port. The five screens are
 reachable by URL and return HTML:
 
 | Route | Screen |
@@ -40,6 +40,7 @@ reachable by URL and return HTML:
 | `http://localhost:8080/signup` | Create an account |
 | `http://localhost:8080/login` | Sign in |
 | `http://localhost:8080/lookup` | Look up a booking by reference |
+| `http://localhost:8080/bookings` | The signed-in diner's own reservations |
 
 ```bash
 curl -s -o /dev/null -w '%{http_code} %{content_type}\n' localhost:8080/
@@ -303,13 +304,14 @@ service, and the rest cover closures, seating plans and agreement-wide
 rescheduling (`tests/test_replans.py`, `tests/test_series_amend.py`) and the import
 of a stage 1, 2 or 3 snapshot (`tests/test_export_import.py`).
 
-The browser half is checked two ways. `tests/test_screens.py` (32 checks) asserts what the
-routes serve: HTML, the named controls, a label on every input, and no reference
-to any other host. `tools/ui-check.mjs` loads those same screens into a DOM and
-drives the product's own script against a running service, which is how the
-behaviour that only a browser can show — a late search response, a lost booking
-response and its retry, a refusal that refreshes the grid — is verified where no
-browser is installed:
+The browser half is checked two ways. `tests/test_screens.py` (32 checks) and
+`tests/test_bookings_screen.py` (15 checks) assert what the routes serve: HTML,
+the named controls, a label on every input, and no reference to any other host.
+`tools/ui-check.mjs` loads those same screens into a DOM and drives the product's
+own script against a running service, which is how the behaviour that only a
+browser can show — a late search response, a lost booking response and its retry,
+a refusal that refreshes the grid, the diner's own list and a cancellation made
+from it — is verified where no browser is installed:
 
 ```bash
 cd tools && npm install jsdom && node ui-check.mjs http://localhost:8080

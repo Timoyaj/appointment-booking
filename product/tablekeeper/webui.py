@@ -66,6 +66,7 @@ def _shell(*, title: str, route: str, body: str) -> str:
     <nav class="nav" aria-label="Screens">
       <a class="nav-link" href="/">Find a table</a>
       <a class="nav-link" href="/lookup">Your booking</a>
+      <a class="nav-link" href="/bookings">Your reservations</a>
       <a class="nav-link nav-link-quiet" href="/console">For restaurants</a>
       <span class="session" id="session-slot">
         <a class="nav-link" href="/login">Sign in</a>
@@ -117,7 +118,7 @@ def search_screen(restaurants: list[dict], today: str) -> str:
       <div class="field">
         <label class="label" for="date-input">Date</label>
         <input class="control" id="date-input" name="date" type="date"
-               value="{_escape(today)}" data-testid="date-input">
+               value="{_escape(today)}" min="{_escape(today)}" data-testid="date-input">
       </div>
       <div class="field">
         <label class="label" for="party-size-input">Party size</label>
@@ -212,11 +213,31 @@ def lookup_screen() -> str:
   </section>"""
 
 
+def bookings_screen() -> str:
+    """`/bookings` — the signed-in diner's own bookings, without a reference.
+
+    The server renders the heading and the spaces the list fills; what is in the
+    list is only the API's to say, so the script draws it. A signed-out visitor
+    is told to sign in rather than shown an empty room.
+    """
+    return """  <section class="screen screen-bookings">
+    <div class="screen-head">
+      <h1 class="title">Your reservations</h1>
+      <p class="lede">Every table you have booked, in one place &mdash; no reference
+      needed. Upcoming sittings come first; from any of them you can open the
+      booking to change or cancel it.</p>
+    </div>
+    <div class="live" id="bookings-status" role="status" aria-live="polite"></div>
+    <div id="bookings" class="bookings" data-testid="bookings-root"></div>
+  </section>"""
+
+
 SCREENS = {
     "/": ("Find your table", search_screen),
     "/signup": ("Create an account", signup_screen),
     "/login": ("Sign in", login_screen),
     "/lookup": ("Look up a booking", lookup_screen),
+    "/bookings": ("Your reservations", bookings_screen),
 }
 
 
@@ -252,4 +273,10 @@ def register(app: FastAPI) -> None:
     def screen_lookup() -> HTMLResponse:
         return HTMLResponse(
             _shell(title="Look up a booking", route="/lookup", body=lookup_screen())
+        )
+
+    @app.get("/bookings", response_class=HTMLResponse, include_in_schema=False)
+    def screen_bookings() -> HTMLResponse:
+        return HTMLResponse(
+            _shell(title="Your reservations", route="/bookings", body=bookings_screen())
         )
